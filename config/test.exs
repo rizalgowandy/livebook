@@ -7,18 +7,29 @@ config :livebook, LivebookWeb.Endpoint,
   server: false
 
 # Print only warnings and errors during test
-config :logger, level: :warn
+config :logger, level: :warning
 
-# Disable authentication mode during test
-config :livebook, :authentication_mode, :disabled
+# Disable authentication in tests
+config :livebook,
+  authentication: :disabled,
+  check_completion_data_interval: 300,
+  iframe_port: 4003
 
-# Use the embedded runtime in tests by default, so they
-# are cheaper to run. Other runtimes can be tested by starting
-# and setting them explicitly
-config :livebook, :default_runtime, {Livebook.Runtime.Embedded, []}
+data_path = Path.expand("tmp/livebook_data/test")
 
-# Use longnames when running tests in CI, so that no host resolution is required,
-# see https://github.com/livebook-dev/livebook/pull/173#issuecomment-819468549
-if System.get_env("CI") == "true" do
-  config :livebook, :node, {:longnames, :"livebook@127.0.0.1"}
+# Clear data path for tests
+if File.exists?(data_path) do
+  File.rm_rf!(data_path)
 end
+
+config :livebook,
+  data_path: data_path,
+  agent_name: "chonky-cat",
+  k8s_kubeconfig_pipeline:
+    {Kubereq.Kubeconfig.Stub,
+     plugs: %{
+       "default" => {Req.Test, :k8s_cluster},
+       "no-permission" => {Req.Test, :k8s_cluster}
+     }}
+
+config :livebook, Livebook.Apps.Manager, retry_backoff_base_ms: 0

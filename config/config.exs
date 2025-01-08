@@ -2,74 +2,47 @@ import Config
 
 # Configures the endpoint
 config :livebook, LivebookWeb.Endpoint,
-  url: [host: "localhost"],
+  adapter: Bandit.PhoenixAdapter,
+  url: [host: "localhost", path: "/"],
   pubsub_server: Livebook.PubSub,
-  live_view: [signing_salt: "livebook"]
+  live_view: [signing_salt: "livebook"],
+  drainer: [shutdown: 1000],
+  render_errors: [formats: [html: LivebookWeb.ErrorHTML], layout: false]
 
 # Configures Elixir's Logger
 config :logger, :console,
-  format: "$time $metadata[$level] $message\n",
+  format: "$date $time $metadata[$level] $message\n",
   metadata: [:request_id]
 
-# Use Jason for JSON parsing in Phoenix
-config :phoenix, :json_library, Jason
+config :phoenix, :json_library, JSON
 
-# Add mime type to upload notebooks with `Phoenix.LiveView.Upload`
+# Additional mime types
 config :mime, :types, %{
+  "audio/m4a" => ["m4a"],
   "text/plain" => ["livemd"]
 }
 
-# Sets the default authentication mode to token
-config :livebook, :authentication_mode, :token
+config :livebook,
+  agent_name: "default",
+  allowed_uri_schemes: [],
+  app_service_name: nil,
+  app_service_url: nil,
+  authentication: :token,
+  aws_credentials: false,
+  feature_flags: [],
+  force_ssl_host: nil,
+  learn_notebooks: [],
+  plugs: [],
+  rewrite_on: [],
+  shutdown_callback: nil,
+  teams_auth?: false,
+  teams_url: "https://teams.livebook.dev",
+  github_release_info: %{repo: "livebook-dev/livebook", version: Mix.Project.config()[:version]},
+  update_instructions_url: nil,
+  within_iframe: false,
+  k8s_kubeconfig_pipeline: Kubereq.Kubeconfig.Default
 
-# Sets the default runtime to ElixirStandalone.
-# This is the desired default most of the time,
-# but in some specific use cases you may want
-# to configure that to the Embedded or Mix runtime instead.
-# Also make sure the configured runtime has
-# a synchronous `init` function that takes the
-# configured arguments.
-config :livebook, :default_runtime, {Livebook.Runtime.ElixirStandalone, []}
-
-# A list of custom plugs in the following format:
-#
-#    [{plug_module :: module(), opts :: keyword()}]
-#
-# The plugs are called directly before the Livebook router.
-config :livebook, :plugs, []
-
-# A list of additional notebooks to include in the Explore sections.
-#
-# Note that the notebooks are loaded and embedded in a compiled module,
-# so the paths are accessed at compile time only.
-#
-# ## Example
-#
-#     config :livebook, :explore_notebooks, [
-#       %{
-#         # Required notebook path
-#         path: "/path/to/notebook.livemd",
-#         # Optional notebook identifier for URLs, as in /explore/notebooks/{slug}
-#         # By default the slug is inferred from file name, so there is no need to set it
-#         slug: "my-notebook"
-#         # Optional list of images
-#         image_paths: [
-#           # This image can be sourced as images/myimage.jpg in the notebook
-#           "/path/to/myimage.jpg"
-#         ],
-#         # Optional details for the notebook card. If omitted, the notebook
-#         # is hidden in the UI, but still accessible under /explore/notebooks/{slug}
-#         details: %{
-#           cover_path: "/path/to/logo.png",
-#           description: "My custom notebook that showcases some amazing stuff."
-#         }
-#       },
-#       %{
-#         path: "/path/to/other_notebook.livemd"
-#       }
-#     ]
-#
-config :livebook, :explore_notebooks, []
+config :livebook, Livebook.Apps.Manager, retry_backoff_base_ms: 5_000
 
 # Import environment specific config. This must remain at the bottom
 # of this file so it overrides the configuration defined above.
