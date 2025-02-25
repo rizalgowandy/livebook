@@ -1,41 +1,100 @@
 defmodule Livebook.Notebook do
-  @moduledoc false
-
   # Data structure representing a notebook.
   #
-  # A notebook is just the representation and roughly
-  # maps to a file that the user can edit.
+  # A notebook is just a document and roughly maps to a plain file
+  # that the user can edit.
   #
-  # A notebook *session* is a living process that holds a specific
+  # A notebook **session** is a living process that holds a specific
   # notebook instance and allows users to collaboratively apply
-  # changes to this notebook.
+  # changes to that notebook. See `Livebook.Session`.
   #
-  # A notebook is divided into a number of *sections*, each
-  # containing a number of *cells*.
+  # Structurally, a notebook is divided into a number of **sections**,
+  # each containing a number of **cells**.
 
   defstruct [
     :name,
-    :version,
+    :setup_section,
     :sections,
     :leading_comments,
     :persist_outputs,
-    :autosave_interval_s
+    :autosave_interval_s,
+    :default_language,
+    :output_counter,
+    :app_settings,
+    :hub_id,
+    :hub_secret_names,
+    :file_entries,
+    :quarantine_file_entry_names,
+    :teams_enabled,
+    :deployment_group_id
   ]
 
-  alias Livebook.Notebook.{Section, Cell}
+  alias Livebook.Notebook
+  alias Livebook.Notebook.Section
+  alias Livebook.Notebook.Cell
+  alias Livebook.FileSystem
   alias Livebook.Utils.Graph
   import Livebook.Utils, only: [access_by_id: 1]
 
   @type t :: %__MODULE__{
           name: String.t(),
-          version: String.t(),
+          setup_section: Section.t(),
           sections: list(Section.t()),
           leading_comments: list(list(line :: String.t())),
           persist_outputs: boolean(),
-          autosave_interval_s: non_neg_integer() | nil
+          autosave_interval_s: non_neg_integer() | nil,
+          default_language: :elixir | :erlang | :python,
+          output_counter: non_neg_integer(),
+          app_settings: Notebook.AppSettings.t(),
+          hub_id: String.t(),
+          hub_secret_names: list(String.t()),
+          file_entries: list(file_entry()),
+          quarantine_file_entry_names: MapSet.t(),
+          teams_enabled: boolean(),
+          deployment_group_id: String.t() | nil
         }
 
-  @version "1.0"
+  @typedoc """
+  File entry represents a virtual file that the notebook is aware of.
+
+  Files can be of different types:
+
+    * `:attachment` - a hard copy of a file managed together with the
+      notebook. These files are stored in files/ directory alongside
+      the notebook file
+
+    * `:file` - absolute link to a file on any of the available file
+      systems
+
+    * `:url` - absolute link to a file available online
+
+  ## Quarantine
+
+  File entries of type `:file` are somewhat sensitive, since they may
+  point to an external file system, like S3. When importing a notebook,
+  we don't want to allow access to arbitrary files, since the user may
+  not realize what exact location the file entry is pointing to. Hence,
+  on import we place these file entries in "quarantine" and require
+  the user to explicitly allow access to them. We persist this choice
+  using the notebook stamp, so if the file is saved and opened later,
+  the files are automatically allowed. If the stamp is not valid, all
+  files are placed back in the quarantine.
+  """
+  @type file_entry ::
+          %{
+            name: String.t(),
+            type: :attachment
+          }
+          | %{
+              name: String.t(),
+              type: :file,
+              file: FileSystem.File.t()
+            }
+          | %{
+              name: String.t(),
+              type: :url,
+              url: String.t()
+            }
 
   @doc """
   Returns a blank notebook.
@@ -44,12 +103,77 @@ defmodule Livebook.Notebook do
   def new() do
     %__MODULE__{
       name: "Untitled notebook",
-      version: @version,
+      setup_section: %{Section.new() | id: "setup-section", name: "Setup", cells: []},
       sections: [],
       leading_comments: [],
       persist_outputs: default_persist_outputs(),
-      autosave_interval_s: default_autosave_interval_s()
+      autosave_interval_s: default_autosave_interval_s(),
+      default_language: :elixir,
+      output_counter: 0,
+      app_settings: Notebook.AppSettings.new(),
+      hub_id: Livebook.Hubs.Personal.id(),
+      hub_secret_names: [],
+      file_entries: [],
+      quarantine_file_entry_names: MapSet.new(),
+      teams_enabled: false,
+      deployment_group_id: nil
     }
+    |> put_setup_cells([Cell.new(:code)])
+  end
+
+  @doc """
+  Sets the given cells as the setup section cells.
+  """
+  @spec put_setup_cells(t(), list(Cell.Code.t())) :: t()
+  def put_setup_cells(notebook, [main_setup_cell | setup_cells]) do
+    put_in(notebook.setup_section.cells, [
+      %{main_setup_cell | id: Cell.main_setup_cell_id()}
+      | Enum.map(setup_cells, &%{&1 | id: Cell.extra_setup_cell_id(&1.language)})
+    ])
+  end
+
+  @doc """
+  Returns the list of languages used by the notebook.
+  """
+  @spec enabled_languages(t()) :: list(atom())
+  def enabled_languages(notebook) do
+    python_setup_cell_id = Cell.extra_setup_cell_id(:"pyproject.toml")
+    python_enabled? = Enum.any?(notebook.setup_section.cells, &(&1.id == python_setup_cell_id))
+    if(python_enabled?, do: [:python], else: []) ++ [:elixir, :erlang]
+  end
+
+  @doc """
+  Adds extra setup cell specific to the given language.
+  """
+  @spec add_extra_setup_cell(t(), atom()) :: t()
+  def add_extra_setup_cell(notebook, language)
+
+  def add_extra_setup_cell(notebook, :python) do
+    cell = %{
+      Cell.new(:code)
+      | id: Cell.extra_setup_cell_id(:"pyproject.toml"),
+        language: :"pyproject.toml",
+        source: """
+        [project]
+        name = "project"
+        version = "0.0.0"
+        requires-python = "==3.13.*"
+        dependencies = []\
+        """
+    }
+
+    update_in(notebook.setup_section.cells, &(&1 ++ [cell]))
+  end
+
+  @doc """
+  Retrieves extra setup cell specific to the given language.
+  """
+  @spec get_extra_setup_cell(t(), atom()) :: Cell.Code.t()
+  def get_extra_setup_cell(notebook, language)
+
+  def get_extra_setup_cell(notebook, :python) do
+    id = Cell.extra_setup_cell_id(:"pyproject.toml")
+    Enum.find(notebook.setup_section.cells, &(&1.id == id))
   end
 
   @doc """
@@ -77,11 +201,21 @@ defmodule Livebook.Notebook do
   end
 
   @doc """
+  Returns all notebook sections, including the implicit ones.
+  """
+  @spec all_sections(t()) :: list(Section.t())
+  def all_sections(notebook) do
+    get_in(notebook, [access_all_sections()])
+  end
+
+  @doc """
   Finds notebook section by id.
   """
   @spec fetch_section(t(), Section.id()) :: {:ok, Section.t()} | :error
   def fetch_section(notebook, section_id) do
-    Enum.find_value(notebook.sections, :error, fn section ->
+    notebook
+    |> all_sections()
+    |> Enum.find_value(:error, fn section ->
       section.id == section_id && {:ok, section}
     end)
   end
@@ -92,7 +226,7 @@ defmodule Livebook.Notebook do
   @spec fetch_cell_and_section(t(), Cell.id()) :: {:ok, Cell.t(), Section.t()} | :error
   def fetch_cell_and_section(notebook, cell_id) do
     for(
-      section <- notebook.sections,
+      section <- all_sections(notebook),
       cell <- section.cells,
       cell.id == cell_id,
       do: {cell, section}
@@ -187,7 +321,7 @@ defmodule Livebook.Notebook do
   def delete_cell(notebook, cell_id) do
     {_, notebook} =
       pop_in(notebook, [
-        Access.key(:sections),
+        access_all_sections(),
         Access.all(),
         Access.key(:cells),
         access_by_id(cell_id)
@@ -203,7 +337,7 @@ defmodule Livebook.Notebook do
   def update_cell(notebook, cell_id, fun) do
     update_in(
       notebook,
-      [Access.key(:sections), Access.all(), Access.key(:cells), access_by_id(cell_id)],
+      [access_all_sections(), Access.all(), Access.key(:cells), access_by_id(cell_id)],
       fun
     )
   end
@@ -215,9 +349,24 @@ defmodule Livebook.Notebook do
   def update_cells(notebook, fun) do
     update_in(
       notebook,
-      [Access.key(:sections), Access.all(), Access.key(:cells), Access.all()],
+      [access_all_sections(), Access.all(), Access.key(:cells), Access.all()],
       fun
     )
+  end
+
+  @doc """
+  Updates cells as `update_cells/2`, but carries an accumulator.
+  """
+  @spec update_reduce_cells(t(), acc, (Cell.t(), acc -> {Cell.t(), acc})) :: {t(), acc}
+        when acc: term()
+  def update_reduce_cells(notebook, acc, fun) do
+    {[setup_section | sections], acc} =
+      Enum.map_reduce([notebook.setup_section | notebook.sections], acc, fn section, acc ->
+        {cells, acc} = Enum.map_reduce(section.cells, acc, fun)
+        {%{section | cells: cells}, acc}
+      end)
+
+    {%{notebook | setup_section: setup_section, sections: sections}, acc}
   end
 
   @doc """
@@ -225,7 +374,21 @@ defmodule Livebook.Notebook do
   """
   @spec update_section(t(), Section.id(), (Section.t() -> Section.t())) :: t()
   def update_section(notebook, section_id, fun) do
-    update_in(notebook, [Access.key(:sections), access_by_id(section_id)], fun)
+    update_in(notebook, [access_all_sections(), access_by_id(section_id)], fun)
+  end
+
+  defp access_all_sections() do
+    fn
+      :get, %__MODULE__{} = notebook, next ->
+        next.([notebook.setup_section | notebook.sections])
+
+      :get_and_update, %__MODULE__{} = notebook, next ->
+        {gets, [setup_section | sections]} = next.([notebook.setup_section | notebook.sections])
+        {gets, %{notebook | setup_section: setup_section, sections: sections}}
+
+      _op, data, _next ->
+        raise "access_all_sections/0 expected %Livebook.Notebook{}, got: #{inspect(data)}"
+    end
   end
 
   @doc """
@@ -357,19 +520,20 @@ defmodule Livebook.Notebook do
   """
   @spec cells_with_section(t()) :: list({Cell.t(), Section.t()})
   def cells_with_section(notebook) do
-    for section <- notebook.sections,
+    for section <- all_sections(notebook),
         cell <- section.cells,
         do: {cell, section}
   end
 
   @doc """
-  Returns a list of `{cell, section}` pairs including all Elixir cells in order.
+  Returns a list of `{cell, section}` pairs including all evaluable
+  cells in order.
   """
-  @spec elixir_cells_with_section(t()) :: list({Cell.t(), Section.t()})
-  def elixir_cells_with_section(notebook) do
+  @spec evaluable_cells_with_section(t()) :: list({Cell.t(), Section.t()})
+  def evaluable_cells_with_section(notebook) do
     notebook
     |> cells_with_section()
-    |> Enum.filter(fn {cell, _section} -> is_struct(cell, Cell.Elixir) end)
+    |> Enum.filter(fn {cell, _section} -> Cell.evaluable?(cell) end)
   end
 
   @doc """
@@ -377,21 +541,30 @@ defmodule Livebook.Notebook do
   before the given one.
 
   The cells are ordered starting from the most direct parent.
+
+  A list of cell ids can be be given, in which case parent cells
+  are computed for each cell and returned as a single list.
   """
-  @spec parent_cells_with_section(t(), Cell.id()) :: list({Cell.t(), Section.t()})
-  def parent_cells_with_section(notebook, cell_id) do
+  @spec parent_cells_with_section(t(), Cell.id() | list(Cell.id())) ::
+          list({Cell.t(), Section.t()})
+  def parent_cells_with_section(notebook, cell_ids) when is_list(cell_ids) do
+    graph = cell_dependency_graph(notebook)
+
     parent_cell_ids =
-      notebook
-      |> cell_dependency_graph()
-      |> Graph.find_path(cell_id, nil)
-      |> MapSet.new()
-      |> MapSet.delete(cell_id)
-      |> MapSet.delete(nil)
+      for cell_id <- cell_ids,
+          parent_cell_id <- Graph.find_path(graph, cell_id, nil),
+          parent_cell_id not in [cell_id, nil],
+          into: MapSet.new(),
+          do: parent_cell_id
 
     notebook
     |> cells_with_section()
     |> Enum.filter(fn {cell, _} -> MapSet.member?(parent_cell_ids, cell.id) end)
     |> Enum.reverse()
+  end
+
+  def parent_cells_with_section(notebook, cell_id) do
+    parent_cells_with_section(notebook, [cell_id])
   end
 
   @doc """
@@ -430,10 +603,12 @@ defmodule Livebook.Notebook do
       cell should be included in the graph. If a cell is
       excluded, transitive parenthood still applies.
       By default all cells are included.
+
   """
   @spec cell_dependency_graph(t()) :: Graph.t(Cell.id())
   def cell_dependency_graph(notebook, opts \\ []) do
-    notebook.sections
+    notebook
+    |> all_sections()
     |> Enum.reduce(
       {%{}, nil, %{}},
       fn section, {graph, prev_regular_section, last_id_by_section} ->
@@ -491,5 +666,323 @@ defmodule Livebook.Notebook do
   @spec forked(t()) :: t()
   def forked(notebook) do
     %{notebook | name: notebook.name <> " - fork"}
+  end
+
+  @doc """
+  Traverses cell outputs to find asset info matching
+  the given hash.
+  """
+  @spec find_asset_info(t(), String.t()) :: (asset_info :: map()) | nil
+  def find_asset_info(notebook, hash) do
+    notebook
+    |> all_sections()
+    |> Enum.find_value(fn section ->
+      Enum.find_value(section.cells, fn
+        %Cell.Smart{js_view: %{assets: %{hash: ^hash} = assets_info}} ->
+          assets_info
+
+        %{outputs: outputs} ->
+          find_assets_info_in_outputs(outputs, hash)
+
+        _cell ->
+          nil
+      end)
+    end)
+  end
+
+  defp find_assets_info_in_outputs(outputs, hash) do
+    Enum.find_value(outputs, fn
+      {_idx, %{type: :js, js_view: %{assets: %{hash: ^hash} = assets_info}}} ->
+        assets_info
+
+      {_idx, output} when output.type in [:frame, :tabs, :grid] ->
+        find_assets_info_in_outputs(output.outputs, hash)
+
+      _ ->
+        nil
+    end)
+  end
+
+  @doc """
+  Removes all outputs from the notebook.
+  """
+  @spec clear_outputs(t()) :: t()
+  def clear_outputs(notebook) do
+    update_cells(notebook, fn
+      %{outputs: _outputs} = cell -> %{cell | outputs: []}
+      cell -> cell
+    end)
+  end
+
+  @doc """
+  Adds new output to the given cell.
+
+  Automatically merges terminal outputs and updates frames.
+  """
+  @spec add_cell_output(t(), Cell.id(), Livebook.Runtime.output()) :: t()
+  def add_cell_output(notebook, cell_id, output) do
+    {notebook, counter} = do_add_cell_output(notebook, cell_id, notebook.output_counter, output)
+    %{notebook | output_counter: counter}
+  end
+
+  defp do_add_cell_output(notebook, _cell_id, counter, %{type: :frame_update} = frame_update) do
+    update_reduce_cells(notebook, counter, fn
+      %{outputs: _} = cell, counter ->
+        {outputs, counter} = update_frames(cell.outputs, counter, frame_update)
+        {%{cell | outputs: outputs}, counter}
+
+      cell, counter ->
+        {cell, counter}
+    end)
+  end
+
+  defp do_add_cell_output(notebook, cell_id, counter, output) do
+    {output, counter} = index_output(output, counter)
+
+    notebook =
+      update_cell(notebook, cell_id, fn cell ->
+        %{cell | outputs: add_output(cell.outputs, output)}
+      end)
+
+    {notebook, counter}
+  end
+
+  defp update_frames(outputs, counter, %{ref: ref} = frame_update) do
+    Enum.map_reduce(outputs, counter, fn
+      {idx, %{type: :frame, outputs: outputs, ref: ^ref} = frame}, counter ->
+        {update_type, new_outputs} = frame_update.update
+        {new_outputs, counter} = index_outputs(new_outputs, counter)
+        outputs = apply_frame_update(outputs, new_outputs, update_type)
+        {{idx, %{frame | outputs: outputs}}, counter}
+
+      {idx, output}, counter when output.type in [:frame, :tabs, :grid] ->
+        {outputs, counter} = update_frames(output.outputs, counter, frame_update)
+        {{idx, %{output | outputs: outputs}}, counter}
+
+      output, counter ->
+        {output, counter}
+    end)
+  end
+
+  defp apply_frame_update(_outputs, new_outputs, :replace) do
+    merge_chunk_outputs(new_outputs)
+  end
+
+  defp apply_frame_update(outputs, new_outputs, :append) do
+    Enum.reduce(Enum.reverse(new_outputs), outputs, &add_output(&2, &1))
+  end
+
+  defp add_output(outputs, {_idx, %{type: :ignored}}), do: outputs
+
+  # Session clients prune rendered chunks, we only add the new one
+  defp add_output(
+         [{idx, %{type: type, chunk: true, text: :__pruned__} = output} | tail],
+         {_idx, %{type: type, chunk: true, text: text}}
+       )
+       when type in [:terminal_text, :plain_text, :markdown] do
+    [{idx, %{output | text: text}} | tail]
+  end
+
+  # Session server keeps all outputs, so we merge consecutive chunks
+  defp add_output(
+         [{idx, %{type: :terminal_text, chunk: true, text: text} = output} | tail],
+         {_idx, %{type: :terminal_text, chunk: true, text: cont}}
+       ) do
+    [{idx, %{output | text: normalize_terminal_text(text <> cont)}} | tail]
+  end
+
+  defp add_output(outputs, {idx, %{type: :terminal_text, text: text} = output}) do
+    [{idx, %{output | text: normalize_terminal_text(text)}} | outputs]
+  end
+
+  defp add_output(
+         [{idx, %{type: type, chunk: true, text: text} = output} | tail],
+         {_idx, %{type: type, chunk: true, text: cont}}
+       )
+       when type in [:plain_text, :markdown] do
+    [{idx, %{output | text: text <> cont}} | tail]
+  end
+
+  defp add_output(outputs, {idx, output}) when output.type in [:frame, :grid] do
+    output = update_in(output.outputs, &merge_chunk_outputs/1)
+    [{idx, output} | outputs]
+  end
+
+  defp add_output(outputs, output), do: [output | outputs]
+
+  defp merge_chunk_outputs(outputs) do
+    outputs
+    |> Enum.reverse()
+    |> Enum.reduce([], &add_output(&2, &1))
+  end
+
+  @doc """
+  Normalizes terminal text chunk.
+
+  Handles CR rewinds and caps output lines.
+  """
+  @spec normalize_terminal_text(String.t()) :: String.t()
+  def normalize_terminal_text(text) do
+    text
+    |> Livebook.Utils.apply_rewind()
+    |> Livebook.Utils.cap_lines(max_terminal_lines())
+  end
+
+  @doc """
+  The maximum desired number of lines of terminal text.
+
+  This is particularly relevant for standard output, which may receive
+  a lot of lines.
+  """
+  def max_terminal_lines(), do: 1_000
+
+  @doc """
+  Recursively adds index to all outputs, including frames.
+  """
+  @spec index_outputs(list(Livebook.Runtime.output()), non_neg_integer()) ::
+          {list(Cell.indexed_output()), non_neg_integer()}
+  def index_outputs(outputs, counter) do
+    Enum.map_reduce(outputs, counter, &index_output/2)
+  end
+
+  defp index_output(output, counter) when output.type in [:frame, :tabs, :grid] do
+    {outputs, counter} = index_outputs(output.outputs, counter)
+    {{counter, %{output | outputs: outputs}}, counter + 1}
+  end
+
+  defp index_output(%{type: :frame_update} = output, counter) do
+    {update_type, new_outputs} = output.update
+    {new_outputs, counter} = index_outputs(new_outputs, counter)
+    {{counter, %{output | update: {update_type, new_outputs}}}, counter + 1}
+  end
+
+  defp index_output(output, counter) do
+    {{counter, output}, counter + 1}
+  end
+
+  @doc """
+  Finds frame outputs matching the given ref.
+  """
+  @spec find_frame_outputs(t(), String.t()) :: list({Cell.indexed_output(), Cell.t()})
+  def find_frame_outputs(notebook, frame_ref) do
+    for section <- all_sections(notebook),
+        %{outputs: outputs} = cell <- section.cells,
+        output <- outputs,
+        frame_output <- do_find_frame_outputs(output, frame_ref),
+        do: {frame_output, cell}
+  end
+
+  defp do_find_frame_outputs({_idx, %{type: :frame, ref: ref}} = output, ref) do
+    [output]
+  end
+
+  defp do_find_frame_outputs({_idx, output}, ref) when output.type in [:frame, :tabs, :grid] do
+    Enum.flat_map(output.outputs, &do_find_frame_outputs(&1, ref))
+  end
+
+  defp do_find_frame_outputs(_output, _ref), do: []
+
+  @doc """
+  Removes outputs that get rendered only once.
+  """
+  @spec prune_cell_outputs(t()) :: t()
+  def prune_cell_outputs(notebook) do
+    update_cells(notebook, fn
+      %{outputs: _outputs} = cell -> %{cell | outputs: prune_outputs(cell.outputs, true)}
+      cell -> cell
+    end)
+  end
+
+  defp prune_outputs(outputs, appendable?) do
+    outputs
+    |> Enum.reverse()
+    |> do_prune_outputs(appendable?, [])
+  end
+
+  defp do_prune_outputs([], _appendable?, acc), do: acc
+
+  # Keep trailing outputs that can be merged with subsequent outputs
+  defp do_prune_outputs([{idx, %{type: type, chunk: true} = output}], true = _appendable?, acc)
+       when type in [:terminal_text, :plain_text, :markdown] do
+    [{idx, %{output | text: :__pruned__}} | acc]
+  end
+
+  # Keep frame and its relevant contents
+  defp do_prune_outputs([{idx, %{type: :frame} = output} | outputs], appendable?, acc) do
+    output = update_in(output.outputs, &prune_outputs(&1, true))
+    do_prune_outputs(outputs, appendable?, [{idx, output} | acc])
+  end
+
+  # Keep layout output and its relevant contents
+  defp do_prune_outputs([{idx, %{type: :tabs} = output} | outputs], appendable?, acc) do
+    case prune_outputs(output.outputs, false) do
+      [] ->
+        do_prune_outputs(outputs, appendable?, acc)
+
+      pruned_tabs_outputs ->
+        output = %{output | outputs: pruned_tabs_outputs}
+        do_prune_outputs(outputs, appendable?, [{idx, output} | acc])
+    end
+  end
+
+  defp do_prune_outputs([{idx, %{type: :grid} = output} | outputs], appendable?, acc) do
+    case prune_outputs(output.outputs, false) do
+      [] ->
+        do_prune_outputs(outputs, appendable?, acc)
+
+      pruned_grid_outputs ->
+        output = %{output | outputs: pruned_grid_outputs}
+        do_prune_outputs(outputs, appendable?, [{idx, output} | acc])
+    end
+  end
+
+  # Keep outputs that get re-rendered
+  defp do_prune_outputs([{idx, output} | outputs], appendable?, acc)
+       when output.type in [:input, :control, :error] do
+    do_prune_outputs(outputs, appendable?, [{idx, output} | acc])
+  end
+
+  # Remove everything else
+  defp do_prune_outputs([_output | outputs], appendable?, acc) do
+    do_prune_outputs(outputs, appendable?, acc)
+  end
+
+  @doc """
+  Validates a change is a valid file entry name.
+  """
+  @spec validate_file_entry_name(Ecto.Changeset.t(), atom()) :: Ecto.Changeset.t()
+  def validate_file_entry_name(changeset, field) do
+    changeset
+    |> Ecto.Changeset.validate_format(field, ~r/^[\w-.]+$/,
+      message: "should contain only alphanumeric characters, dash, underscore and dot"
+    )
+    |> Ecto.Changeset.validate_format(field, ~r/\.\w+$/, message: "should end with an extension")
+  end
+
+  @doc """
+  Copies notebook files from one directory to another.
+
+  Note that the source directory may have more files, only the ones
+  used by the notebook are copied.
+
+  If any of the notebook files does not exist, this function returns
+  an error.
+  """
+  @spec copy_files(t(), FileSystem.File.t(), FileSystem.File.t()) :: :ok | {:error, String.t()}
+  def copy_files(notebook, source_dir, files_dir) do
+    notebook.file_entries
+    |> Enum.filter(&(&1.type == :attachment))
+    |> Enum.reduce_while(:ok, fn file_entry, :ok ->
+      source_file = FileSystem.File.resolve(source_dir, file_entry.name)
+      destination_file = FileSystem.File.resolve(files_dir, file_entry.name)
+
+      case FileSystem.File.copy(source_file, destination_file) do
+        :ok ->
+          {:cont, :ok}
+
+        {:error, error} ->
+          {:halt, {:error, "failed to copy notebook file #{file_entry.name}, #{error}"}}
+      end
+    end)
   end
 end

@@ -3,27 +3,61 @@ defmodule Livebook.LiveMarkdown.Export do
   alias Livebook.Notebook.Cell
   alias Livebook.LiveMarkdown.MarkdownHelpers
 
-  @doc """
-  Converts the given notebook into a Markdown document.
+  def notebook_to_livemd(notebook, opts \\ []) do
+    include_outputs? = Keyword.get(opts, :include_outputs, notebook.persist_outputs)
+    include_stamp? = Keyword.get(opts, :include_stamp, true)
 
-  ## Options
+    js_ref_with_export = if include_outputs?, do: collect_js_output_export(notebook), else: %{}
 
-    * `:include_outputs` - whether to render cell outputs.
-      Only textual outputs are included. Defaults to the
-      value of `:persist_outputs` notebook attribute.
-  """
-  @spec notebook_to_markdown(Notebook.t(), keyword()) :: String.t()
-  def notebook_to_markdown(notebook, opts \\ []) do
-    ctx = %{
-      include_outputs?: Keyword.get(opts, :include_outputs, notebook.persist_outputs)
-    }
+    ctx = %{include_outputs?: include_outputs?, js_ref_with_export: js_ref_with_export}
 
     iodata = render_notebook(notebook, ctx)
+
     # Add trailing newline
-    IO.iodata_to_binary([iodata, "\n"])
+    notebook_source = [iodata, "\n"]
+
+    {notebook_footer, footer_warnings} =
+      render_notebook_footer(notebook, notebook_source, include_stamp?)
+
+    source = IO.iodata_to_binary([notebook_source, notebook_footer])
+
+    {source, footer_warnings}
+  end
+
+  defp collect_js_output_export(notebook) do
+    for(
+      section <- notebook.sections,
+      %{outputs: outputs} <- section.cells,
+      {_idx, %{type: :js, js_view: js_view, export: true}} <- outputs,
+      do: {js_view.ref, js_view.pid},
+      uniq: true
+    )
+    |> Enum.map(fn {ref, pid} ->
+      Task.async(fn -> {ref, get_js_output_export(pid, ref)} end)
+    end)
+    |> Task.await_many(:infinity)
+    |> Map.new()
+  end
+
+  defp get_js_output_export(pid, ref) do
+    send(pid, {:export, self(), %{ref: ref}})
+
+    monitor_ref = Process.monitor(pid)
+
+    data =
+      receive do
+        {:export_reply, export_result, %{ref: ^ref}} -> export_result
+        {:DOWN, ^monitor_ref, :process, _pid, _reason} -> nil
+      end
+
+    Process.demonitor(monitor_ref, [:flush])
+
+    data
   end
 
   defp render_notebook(notebook, ctx) do
+    %{setup_section: %{cells: setup_cells}} = notebook
+
     comments =
       Enum.map(notebook.leading_comments, fn
         [line] -> ["<!-- ", line, " -->"]
@@ -31,12 +65,14 @@ defmodule Livebook.LiveMarkdown.Export do
       end)
 
     name = ["# ", notebook.name]
+    setup_cells = render_setup_cells(setup_cells, %{ctx | include_outputs?: false})
     sections = Enum.map(notebook.sections, &render_section(&1, notebook, ctx))
 
     metadata = notebook_metadata(notebook)
 
     notebook_with_metadata =
-      [name | sections]
+      [name | setup_cells ++ sections]
+      |> Enum.reject(&is_nil/1)
       |> Enum.intersperse("\n\n")
       |> prepend_metadata(metadata)
 
@@ -44,11 +80,67 @@ defmodule Livebook.LiveMarkdown.Export do
   end
 
   defp notebook_metadata(notebook) do
+    keys = [
+      :persist_outputs,
+      :autosave_interval_s,
+      :default_language,
+      :hub_id,
+      :deployment_group_id
+    ]
+
+    metadata = put_unless_default(%{}, Map.take(notebook, keys), Map.take(Notebook.new(), keys))
+
+    app_settings_metadata = app_settings_metadata(notebook.app_settings)
+
+    file_entry_metadata =
+      notebook.file_entries
+      |> Enum.sort_by(& &1.name)
+      |> Enum.map(&file_entry_metadata/1)
+
+    put_unless_default(
+      metadata,
+      %{app_settings: app_settings_metadata, file_entries: file_entry_metadata},
+      %{app_settings: %{}, file_entries: []}
+    )
+  end
+
+  defp app_settings_metadata(app_settings) do
+    keys = [
+      :slug,
+      :multi_session,
+      :zero_downtime,
+      :show_existing_sessions,
+      :auto_shutdown_ms,
+      :access_type,
+      :show_source,
+      :output_type
+    ]
+
     put_unless_default(
       %{},
-      Map.take(notebook, [:persist_outputs, :autosave_interval_s]),
-      Map.take(Notebook.new(), [:persist_outputs, :autosave_interval_s])
+      Map.take(app_settings, keys),
+      Map.take(Notebook.AppSettings.new(), keys)
     )
+  end
+
+  defp file_entry_metadata(%{type: :attachment, name: name}) do
+    %{type: "attachment", name: name}
+  end
+
+  defp file_entry_metadata(%{type: :file, name: name, file: file}) do
+    %{
+      type: "file",
+      name: name,
+      file: %{
+        file_system_id: file.file_system_id,
+        file_system_type: Livebook.FileSystems.module_to_type(file.file_system_module),
+        path: file.path
+      }
+    }
+  end
+
+  defp file_entry_metadata(%{type: :url, name: name, url: url}) do
+    %{type: "url", name: name, url: url}
   end
 
   defp render_section(section, notebook, ctx) do
@@ -83,6 +175,14 @@ defmodule Livebook.LiveMarkdown.Export do
     %{"branch_parent_index" => parent_idx}
   end
 
+  defp render_setup_cells([%{source: ""}], _ctx), do: []
+
+  defp render_setup_cells(cells, ctx) do
+    Enum.map(cells, fn cell ->
+      render_cell(cell, ctx)
+    end)
+  end
+
   defp render_cell(%Cell.Markdown{} = cell, _ctx) do
     metadata = cell_metadata(cell)
 
@@ -91,15 +191,15 @@ defmodule Livebook.LiveMarkdown.Export do
     |> prepend_metadata(metadata)
   end
 
-  defp render_cell(%Cell.Elixir{} = cell, ctx) do
+  defp render_cell(%Cell.Code{} = cell, ctx) do
     delimiter = MarkdownHelpers.code_block_delimiter(cell.source)
-    code = get_elixir_cell_code(cell)
-    outputs = if ctx.include_outputs?, do: render_outputs(cell), else: []
+    code = cell.source
+    outputs = if ctx.include_outputs?, do: render_outputs(cell, ctx), else: []
 
     metadata = cell_metadata(cell)
 
     cell =
-      [delimiter, "elixir\n", code, "\n", delimiter]
+      [delimiter, Atom.to_string(cell.language), "\n", code, "\n", delimiter]
       |> prepend_metadata(metadata)
 
     if outputs == [] do
@@ -109,51 +209,89 @@ defmodule Livebook.LiveMarkdown.Export do
     end
   end
 
-  defp cell_metadata(%Cell.Elixir{} = cell) do
-    put_unless_default(
-      %{},
-      Map.take(cell, [:disable_formatting, :reevaluate_automatically]),
-      Map.take(Cell.Elixir.new(), [:disable_formatting, :reevaluate_automatically])
-    )
+  defp render_cell(%Cell.Smart{} = cell, ctx) do
+    %{Cell.Code.new() | source: cell.source, outputs: cell.outputs}
+    |> render_cell(ctx)
+    |> prepend_metadata(%{
+      "livebook_object" => "smart_cell",
+      "kind" => cell.kind,
+      # Attributes may include arbitrary values, including sequences
+      # like "-->" that would mess our format, so we always encode them
+      "attrs" => cell.attrs |> JSON.encode!(&encode_sorting/2) |> Base.encode64(padding: false),
+      "chunks" => cell.chunks && Enum.map(cell.chunks, &Tuple.to_list/1)
+    })
+  end
+
+  defp cell_metadata(%Cell.Code{} = cell) do
+    keys = [:reevaluate_automatically, :continue_on_error]
+    put_unless_default(%{}, Map.take(cell, keys), Map.take(Cell.Code.new(), keys))
   end
 
   defp cell_metadata(_cell), do: %{}
 
-  defp render_outputs(cell) do
+  defp render_outputs(cell, ctx) do
     cell.outputs
     |> Enum.reverse()
-    |> Enum.map(&render_output/1)
+    |> Enum.map(fn {_idx, output} -> render_output(output, ctx) end)
     |> Enum.reject(&(&1 == :ignored))
     |> Enum.intersperse("\n\n")
   end
 
-  defp render_output(text) when is_binary(text) do
+  defp render_output(%{type: :terminal_text, text: text}, _ctx) do
     text = String.replace_suffix(text, "\n", "")
     delimiter = MarkdownHelpers.code_block_delimiter(text)
     text = strip_ansi(text)
-    [delimiter, "output\n", text, "\n", delimiter]
+
+    [delimiter, "\n", text, "\n", delimiter]
+    |> prepend_metadata(%{output: true})
   end
 
-  defp render_output({:text, text}) do
-    delimiter = MarkdownHelpers.code_block_delimiter(text)
-    text = strip_ansi(text)
-    [delimiter, "output\n", text, "\n", delimiter]
+  defp render_output(%{type: :js, js_view: %{ref: ref}}, ctx) do
+    with {info_string, payload} <- ctx.js_ref_with_export[ref],
+         {:ok, binary} <- encode_js_data(payload) do
+      delimiter = MarkdownHelpers.code_block_delimiter(binary)
+
+      [delimiter, info_string, "\n", binary, "\n", delimiter]
+      |> prepend_metadata(%{output: true})
+    else
+      _ -> :ignored
+    end
   end
 
-  defp render_output({:vega_lite_static, spec}) do
-    ["```", "vega-lite\n", Jason.encode!(spec), "\n", "```"]
+  defp render_output(%{type: :tabs, outputs: outputs}, ctx) do
+    Enum.find_value(outputs, :ignored, fn {_idx, output} ->
+      case render_output(output, ctx) do
+        :ignored -> nil
+        rendered -> rendered
+      end
+    end)
   end
 
-  defp render_output(_output), do: :ignored
+  defp render_output(%{type: :grid, outputs: outputs}, ctx) do
+    outputs
+    |> Enum.map(fn {_idx, output} -> render_output(output, ctx) end)
+    |> Enum.reject(&(&1 == :ignored))
+    |> case do
+      [] -> :ignored
+      rendered -> Enum.intersperse(rendered, "\n\n")
+    end
+  end
 
-  defp get_elixir_cell_code(%{source: source, disable_formatting: true}),
-    do: source
+  defp render_output(_output, _ctx), do: :ignored
 
-  defp get_elixir_cell_code(%{source: source}), do: format_code(source)
+  defp encode_js_data(data) when is_binary(data), do: {:ok, data}
+
+  defp encode_js_data(data) do
+    try do
+      {:ok, JSON.encode!(data, &encode_sorting/2)}
+    rescue
+      _error -> :error
+    end
+  end
 
   defp render_metadata(metadata) do
-    metadata_json = Jason.encode!(metadata)
-    "<!-- livebook:#{metadata_json} -->"
+    metadata_json = JSON.encode_to_iodata!(metadata, &encode_sorting/2)
+    ["<!-- livebook:", metadata_json, " -->"]
   end
 
   defp prepend_metadata(iodata, metadata) when metadata == %{}, do: iodata
@@ -188,20 +326,13 @@ defmodule Livebook.LiveMarkdown.Export do
 
   defp add_markdown_annotation_before_elixir_block(ast) do
     Enum.flat_map(ast, fn
-      {"pre", _, [{"code", [{"class", "elixir"}], [_source], %{}}], %{}} = ast_node ->
+      {"pre", _, [{"code", [{"class", language}], [_source], %{}}], %{}} = ast_node
+      when language in ["elixir", "erlang", "python", "pyproject.toml"] ->
         [{:comment, [], [~s/livebook:{"force_markdown":true}/], %{comment: true}}, ast_node]
 
       ast_node ->
         [ast_node]
     end)
-  end
-
-  defp format_code(code) do
-    try do
-      Code.format_string!(code)
-    rescue
-      _ -> code
-    end
   end
 
   defp put_unless_default(map, entries, defaults) do
@@ -217,6 +348,87 @@ defmodule Livebook.LiveMarkdown.Export do
   defp strip_ansi(string) do
     string
     |> Livebook.Utils.ANSI.parse_ansi_string()
+    |> elem(0)
     |> Enum.map(fn {_modifiers, string} -> string end)
   end
+
+  defp render_notebook_footer(_notebook, _notebook_source, _include_stamp? = false), do: {[], []}
+
+  defp render_notebook_footer(notebook, notebook_source, true) do
+    metadata = notebook_stamp_metadata(notebook)
+
+    case Livebook.Hubs.fetch_hub(notebook.hub_id) do
+      {:ok, hub} ->
+        case Livebook.Hubs.notebook_stamp(hub, notebook_source, metadata) do
+          {:ok, stamp} ->
+            offset = IO.iodata_length(notebook_source)
+
+            json =
+              %{"offset" => offset, "stamp" => stamp}
+              |> JSON.encode_to_iodata!(&encode_sorting/2)
+
+            footer = ["\n", "<!-- livebook:", json, " -->", "\n"]
+            {footer, []}
+
+          :skip ->
+            {[], []}
+
+          {:error, message} ->
+            {[], ["failed to stamp the notebook, #{message}"]}
+        end
+
+      :error ->
+        {[], []}
+    end
+  end
+
+  defp notebook_stamp_metadata(notebook) do
+    keys = [:hub_secret_names]
+
+    metadata = put_unless_default(%{}, Map.take(notebook, keys), Map.take(Notebook.new(), keys))
+
+    # If there are any :file file entries, we want to generate a stamp
+    # to make sure the entries are not tampered with. We also want to
+    # store the information about file entries already in quarantine
+    metadata =
+      if Enum.any?(notebook.file_entries, &(&1.type == :file)) do
+        Map.put(
+          metadata,
+          :quarantine_file_entry_names,
+          MapSet.to_list(notebook.quarantine_file_entry_names)
+        )
+      else
+        metadata
+      end
+
+    if notebook.app_settings.slug != nil and notebook.app_settings.access_type == :protected do
+      Map.put(metadata, :app_settings_password, notebook.app_settings.password)
+    else
+      metadata
+    end
+  end
+
+  # Wraps JSON.protocol_encode/2 to encode maps as sorted objects
+  defp encode_sorting(term, encoder) when is_non_struct_map(term) do
+    term
+    |> Enum.sort()
+    |> encode_object(encoder)
+  end
+
+  defp encode_sorting(term, encoder), do: JSON.protocol_encode(term, encoder)
+
+  defp encode_object([], _encoder), do: "{}"
+
+  defp encode_object(pairs, encoder) do
+    [[_comma | entry] | entries] =
+      Enum.map(pairs, fn {key, value} ->
+        [?,, encode_key(key, encoder), ?:, encoder.(value, encoder)]
+      end)
+
+    [?{, entry, entries, ?}]
+  end
+
+  defp encode_key(key, encoder) when is_binary(key) or is_atom(key), do: encoder.(key, encoder)
+  defp encode_key(key, _encoder) when is_integer(key), do: [?", Integer.to_string(key), ?"]
+  defp encode_key(key, _encoder) when is_float(key), do: [?", Float.to_string(key), ?"]
 end

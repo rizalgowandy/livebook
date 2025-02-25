@@ -1,98 +1,437 @@
 defmodule Livebook.Config do
-  @moduledoc false
-
   alias Livebook.FileSystem
 
-  @type auth_mode() :: :token | :password | :disabled
+  @type authentication ::
+          %{mode: :password, secret: String.t()}
+          | %{mode: :token, secret: String.t()}
+          | %{mode: :disabled}
 
   @doc """
-  Returns the longname if the distribution mode is configured to use long names.
-  """
-  @spec longname() :: binary() | nil
-  def longname() do
-    host = Livebook.Utils.node_host()
+  Returns path to Livebook priv directory.
 
-    if host =~ "." do
-      host
-    end
+  This returns the usual priv directory, however in case of Escript,
+  the priv files are extracted into a temporary directory and that is
+  the path returned.
+  """
+  @spec priv_path() :: String.t()
+  def priv_path() do
+    Application.get_env(:livebook, :priv_dir) || Application.app_dir(:livebook, "priv")
   end
 
   @doc """
-  Returns the runtime module and `init` args used to start
-  the default runtime.
+  Returns docker images to be used when generating sample Dockerfiles.
   """
-  @spec default_runtime() :: {Livebook.Runtime.t(), list()}
+  @spec docker_images() ::
+          list(%{
+            tag: String.t(),
+            name: String.t(),
+            env: list({String.t(), String.t()})
+          })
+  def docker_images() do
+    version = app_version()
+
+    version = if version =~ "dev", do: "nightly", else: version
+
+    [
+      %{tag: version, name: "Livebook", env: []},
+      %{tag: "#{version}-cuda12", name: "Livebook + CUDA 12", env: []}
+    ]
+  end
+
+  @doc """
+  Returns the default runtime.
+  """
+  @spec default_runtime() :: Livebook.Runtime.t()
   def default_runtime() do
     Application.fetch_env!(:livebook, :default_runtime)
   end
 
   @doc """
-  Returns the authentication mode.
+  Returns the default runtime for app sessions.
   """
-  @spec auth_mode() :: auth_mode()
-  def auth_mode() do
-    Application.fetch_env!(:livebook, :authentication_mode)
+  @spec default_app_runtime() :: Livebook.Runtime.t()
+  def default_app_runtime() do
+    Application.fetch_env!(:livebook, :default_app_runtime)
   end
 
   @doc """
-  Returns the list of currently available file systems.
+  Returns if the runtime module is enabled.
   """
-  @spec file_systems() :: list(FileSystem.t())
-  def file_systems() do
-    Application.fetch_env!(:livebook, :file_systems)
+  @spec runtime_enabled?(module()) :: boolean()
+  def runtime_enabled?(runtime) do
+    runtime in Application.fetch_env!(:livebook, :runtime_modules) or
+      runtime == default_runtime().__struct__
   end
 
   @doc """
-  Appends a new file system to the configured ones.
+  Returns the authentication configuration.
   """
-  @spec append_file_system(FileSystem.t()) :: list(FileSystem.t())
-  def append_file_system(file_system) do
-    file_systems = Enum.uniq(file_systems() ++ [file_system])
-    Application.put_env(:livebook, :file_systems, file_systems, persistent: true)
-    file_systems
+  @spec authentication() :: authentication()
+  def authentication() do
+    case Application.fetch_env!(:livebook, :authentication) do
+      {:password, password} -> %{mode: :password, secret: password}
+      :token -> %{mode: :token, secret: auth_token()}
+      :disabled -> %{mode: :disabled}
+    end
+  end
+
+  @auth_token_key {__MODULE__, :auth_token}
+
+  defp auth_token() do
+    if token = :persistent_term.get(@auth_token_key, nil) do
+      token
+    else
+      token = Livebook.Utils.random_long_id()
+      :persistent_term.put(@auth_token_key, token)
+      token
+    end
   end
 
   @doc """
-  Removes the given file system from the configured ones.
+  Returns the local file system.
   """
-  @spec remove_file_system(FileSystem.t()) :: list(FileSystem.t())
-  def remove_file_system(file_system) do
-    file_systems = List.delete(file_systems(), file_system)
-    Application.put_env(:livebook, :file_systems, file_systems, persistent: true)
-    file_systems
+  @spec local_file_system() :: FileSystem.t()
+  def local_file_system do
+    :persistent_term.get(:livebook_local_file_system)
   end
 
   @doc """
-  Returns the default directory.
+  Returns the local file system home.
   """
-  @spec default_dir() :: FileSystem.File.t()
-  def default_dir() do
-    [file_system | _] = Livebook.Config.file_systems()
-    FileSystem.File.new(file_system)
+  @spec local_file_system_home() :: FileSystem.File.t()
+  def local_file_system_home do
+    FileSystem.File.new(local_file_system())
+  end
+
+  @doc """
+  Returns the home path.
+  """
+  @spec home() :: String.t()
+  def home do
+    Application.get_env(:livebook, :home) || user_home() || File.cwd!()
+  end
+
+  defp user_home(), do: System.user_home() |> Path.expand()
+
+  @doc """
+  Returns the configuration path.
+  """
+  @spec data_path() :: String.t()
+  def data_path() do
+    Application.get_env(:livebook, :data_path) || :filename.basedir(:user_data, "livebook")
+  end
+
+  @doc """
+  Returns path to Livebook temporary dir.
+  """
+  @spec tmp_path() :: String.t()
+  def tmp_path() do
+    tmp_dir = System.tmp_dir!() |> Path.expand()
+    Path.join([tmp_dir, "livebook", app_version()])
+  end
+
+  @doc """
+  Returns the apps path.
+  """
+  @spec apps_path() :: String.t() | nil
+  def apps_path() do
+    Application.get_env(:livebook, :apps_path)
+  end
+
+  @doc """
+  Returns the password configured for all apps deployed from `apps_path`.
+  """
+  @spec apps_path_password() :: String.t() | nil
+  def apps_path_password() do
+    Application.get_env(:livebook, :apps_path_password)
+  end
+
+  @doc """
+  Returns the hub configured for all apps deployed from `apps_path`.
+  """
+  @spec apps_path_hub_id() :: String.t() | nil
+  def apps_path_hub_id() do
+    Application.get_env(:livebook, :apps_path_hub_id)
+  end
+
+  @doc """
+  Returns warmup mode for apps deployed from dir.
+  """
+  @spec apps_path_warmup() :: :auto | :manual
+  def apps_path_warmup() do
+    Application.get_env(:livebook, :apps_path_warmup, :auto)
+  end
+
+  @doc """
+  Returns the configured port for the Livebook endpoint.
+
+  Note that the value may be `0`.
+  """
+  @spec port() :: pos_integer() | 0
+  def port() do
+    Application.get_env(:livebook, LivebookWeb.Endpoint)[:http][:port]
+  end
+
+  @doc """
+  Returns the configured port for the iframe endpoint.
+  """
+  @spec iframe_port() :: pos_integer() | 0
+  def iframe_port() do
+    case port() do
+      0 -> 0
+      _ -> Application.fetch_env!(:livebook, :iframe_port)
+    end
+  end
+
+  @doc """
+  Returns the configured URL for the iframe endpoint.
+  """
+  @spec iframe_url() :: String.t() | nil
+  def iframe_url() do
+    Application.get_env(:livebook, :iframe_url)
+  end
+
+  @doc """
+  Returns if this instance is running with teams auth,
+  i.e. if there an online or offline hub created on boot.
+  """
+  @spec teams_auth?() :: boolean()
+  def teams_auth?() do
+    Application.fetch_env!(:livebook, :teams_auth?)
+  end
+
+  @doc """
+  Returns the configured URL for the Livebook Teams endpoint.
+  """
+  @spec teams_url() :: String.t()
+  def teams_url() do
+    Application.fetch_env!(:livebook, :teams_url)
+  end
+
+  @doc """
+  Returns the configured name for the Livebook Agent session.
+  """
+  @spec agent_name() :: String.t()
+  def agent_name() do
+    Application.fetch_env!(:livebook, :agent_name)
+  end
+
+  @doc """
+  Returns if aws_credentials is enabled.
+  """
+  @spec aws_credentials?() :: boolean()
+  def aws_credentials?() do
+    Application.fetch_env!(:livebook, :aws_credentials)
+  end
+
+  @doc """
+  Shuts down the system, if possible.
+  """
+  def shutdown do
+    case Livebook.Config.shutdown_callback() do
+      {m, f, a} ->
+        Phoenix.PubSub.broadcast(Livebook.PubSub, "sidebar", :shutdown)
+        apply(m, f, a)
+
+      nil ->
+        :ok
+    end
+  end
+
+  @doc """
+  Returns an mfa if there's a way to shut down the system.
+  """
+  @spec shutdown_callback() :: {module(), atom(), list()} | nil
+  def shutdown_callback() do
+    Application.fetch_env!(:livebook, :shutdown_callback)
+  end
+
+  @doc """
+  Returns the identity provider.
+  """
+  @spec identity_provider() :: {atom(), module, binary}
+  def identity_provider() do
+    case Application.fetch_env(:livebook, :identity_provider) do
+      {:ok, result} -> result
+      :error -> {:session, Livebook.ZTA.PassThrough, :unused}
+    end
+  end
+
+  @identity_provider_no_id [Livebook.ZTA.BasicAuth, Livebook.ZTA.PassThrough]
+
+  @doc """
+  Returns if the identity data is readonly.
+  """
+  @spec identity_provider_read_only?() :: boolean()
+  def identity_provider_read_only?() do
+    {_type, module, _key} = Livebook.Config.identity_provider()
+    module not in @identity_provider_no_id
+  end
+
+  @doc """
+  Returns if the identity provider supports logout.
+  """
+  @spec logout_enabled?() :: boolean()
+  def logout_enabled?() do
+    {_type, module, _key} = Livebook.Config.identity_provider()
+
+    Code.ensure_loaded?(module) and function_exported?(module, :logout, 2)
+  end
+
+  @doc """
+  Returns whether the application is running inside an iframe.
+  """
+  @spec within_iframe?() :: boolean()
+  def within_iframe? do
+    Application.fetch_env!(:livebook, :within_iframe)
+  end
+
+  @doc """
+  Returns the application service name.
+  """
+  @spec app_service_name() :: String.t() | nil
+  def app_service_name() do
+    Application.fetch_env!(:livebook, :app_service_name)
+  end
+
+  @doc """
+  Returns the application service url.
+  """
+  @spec app_service_url() :: String.t() | nil
+  def app_service_url() do
+    Application.fetch_env!(:livebook, :app_service_url)
+  end
+
+  @doc """
+  Returns the update check URL.
+  """
+  @spec update_instructions_url() :: String.t() | nil
+  def update_instructions_url() do
+    Application.fetch_env!(:livebook, :update_instructions_url)
+  end
+
+  @doc """
+  Returns the force ssl host if any.
+  """
+  def force_ssl_host do
+    Application.fetch_env!(:livebook, :force_ssl_host)
+  end
+
+  @doc """
+  Returns rewrite_on headers.
+  """
+  def rewrite_on do
+    Application.fetch_env!(:livebook, :rewrite_on)
+  end
+
+  @doc """
+  Returns the application cacertfile if any.
+  """
+  # TODO: Remove env var once support is added either to Erlang/OTP 28 or Elixir v1.18
+  @spec cacertfile() :: String.t() | nil
+  def cacertfile() do
+    Application.get_env(:livebook, :cacertfile)
+  end
+
+  @feature_flags Application.compile_env(:livebook, :feature_flags)
+
+  @doc """
+  Returns the feature flag list.
+  """
+  @spec feature_flags() :: keyword(boolean())
+  def feature_flags() do
+    @feature_flags
+  end
+
+  @doc """
+  Returns enabled feature flags.
+  """
+  @spec enabled_feature_flags() :: list()
+  def enabled_feature_flags() do
+    for {flag, enabled?} <- feature_flags(), enabled?, do: flag
+  end
+
+  @doc """
+  Return if the feature flag is enabled.
+  """
+  @spec feature_flag_enabled?(atom()) :: boolean()
+  def feature_flag_enabled?(key) do
+    Keyword.get(@feature_flags, key, false)
+  end
+
+  @doc """
+  Return list of additional allowed hyperlink schemes.
+  """
+  @spec allowed_uri_schemes() :: list(String.t())
+  def allowed_uri_schemes() do
+    Application.fetch_env!(:livebook, :allowed_uri_schemes)
+  end
+
+  @doc """
+  Returns a random id set on boot.
+  """
+  def random_boot_id() do
+    Application.fetch_env!(:livebook, :random_boot_id)
+  end
+
+  @doc """
+  If we should warn when using production servers.
+  """
+  def warn_on_live_teams_server?() do
+    Application.get_env(:livebook, :warn_on_live_teams_server, false)
+  end
+
+  @app_version Mix.Project.config()[:version]
+
+  @doc """
+  Returns the current version of running Livebook.
+  """
+  def app_version(), do: @app_version
+
+  @app? Mix.target() == :app
+
+  @doc """
+  Returns whether running at the desktop app.
+  """
+  @spec app?() :: boolean()
+  def app?(), do: @app?
+
+  @doc """
+  Returns the GitHub org/repo where the releases are created.
+  """
+  @spec github_release_info() :: %{repo: String.t(), version: String.t()}
+  def github_release_info() do
+    Application.get_env(:livebook, :github_release_info)
+  end
+
+  @doc """
+  Aborts booting due to a configuration error.
+  """
+  @spec abort!(String.t()) :: no_return()
+  def abort!(message) do
+    IO.puts("\nERROR!!! [Livebook] " <> message)
+    System.halt(1)
   end
 
   ## Parsing
 
   @doc """
-  Parses and validates the root path from env.
+  Parses and validates dir from env.
   """
-  def root_path!(env) do
-    if root_path = System.get_env(env) do
-      root_path!("LIVEBOOK_ROOT_PATH", root_path)
-    else
-      File.cwd!()
+  def writable_dir!(env) do
+    if dir = System.get_env(env) do
+      if writable_dir?(dir) do
+        Path.expand(dir)
+      else
+        abort!("expected #{env} to be a writable directory: #{dir}")
+      end
     end
   end
 
-  @doc """
-  Validates `root_path` within context.
-  """
-  def root_path!(context, root_path) do
-    if File.dir?(root_path) do
-      root_path
-    else
-      IO.warn("ignoring #{context} because it doesn't point to a directory: #{root_path}")
-      File.cwd!()
+  defp writable_dir?(path) do
+    case File.stat(path) do
+      {:ok, %{type: :directory, access: access}} when access in [:read_write, :write] -> true
+      _ -> false
     end
   end
 
@@ -113,14 +452,49 @@ defmodule Livebook.Config do
   end
 
   @doc """
+  Parses and validates log level from env.
+  """
+  def log_level!(env) do
+    levels = ~w(error warning notice info debug)
+
+    if level = System.get_env(env) do
+      if level in levels do
+        String.to_atom(level)
+      else
+        abort!("expected #{env} to be one of #{Enum.join(levels, ", ")}, got: #{inspect(levels)}")
+      end
+    end
+  end
+
+  @doc """
+  Parses and validates log metadata keys from env.
+  """
+  def log_metadata!(env) do
+    if metadata = System.get_env(env) do
+      for item <- String.split(metadata, ","),
+          key = String.trim(item),
+          do: String.to_atom(key)
+    end
+  end
+
+  @doc """
   Parses and validates the port from env.
   """
   def port!(env) do
     if port = System.get_env(env) do
       case Integer.parse(port) do
-        {port, ""} -> port
-        :error -> abort!("expected #{env} to be an integer, got: #{inspect(port)}")
+        {port, ""} when port >= 0 -> port
+        :error -> abort!("expected #{env} to be a non-negative integer, got: #{inspect(port)}")
       end
+    end
+  end
+
+  @doc """
+  Parses and validates the base url path from env.
+  """
+  def base_url_path!(env) do
+    if base_url_path = System.get_env(env) do
+      String.trim_trailing(base_url_path, "/")
     end
   end
 
@@ -156,6 +530,34 @@ defmodule Livebook.Config do
   end
 
   @doc """
+  Parses node from env.
+  """
+  def node!(env) do
+    if node = System.get_env(env) do
+      String.to_atom(node)
+    end
+  end
+
+  @doc """
+  Parses info for `Plug.RewriteOn`.
+  """
+  def rewrite_on!(env) do
+    if headers = System.get_env(env) do
+      headers
+      |> String.split(",")
+      |> Enum.map(&(&1 |> String.trim() |> rewrite_on!(env)))
+    else
+      []
+    end
+  end
+
+  defp rewrite_on!("x-forwarded-for", _env), do: :x_forwarded_for
+  defp rewrite_on!("x-forwarded-host", _env), do: :x_forwarded_host
+  defp rewrite_on!("x-forwarded-port", _env), do: :x_forwarded_port
+  defp rewrite_on!("x-forwarded-proto", _env), do: :x_forwarded_proto
+  defp rewrite_on!(header, env), do: abort!("unknown header #{inspect(header)} given to #{env}")
+
+  @doc """
   Parses and validates the password from env.
   """
   def password!(env) do
@@ -169,80 +571,106 @@ defmodule Livebook.Config do
   end
 
   @doc """
-  Parses token auth setting from env.
+  Parses boolean setting from env.
   """
-  def token_enabled!(env) do
-    System.get_env(env, "1") in ~w(true 1)
+  def boolean!(env, default \\ false) do
+    case System.get_env(env) do
+      nil -> default
+      var -> var in ~w(true 1)
+    end
+  end
+
+  @doc """
+  Parses force ssl host setting from env.
+  """
+  def force_ssl_host!(env) do
+    System.get_env(env)
+  end
+
+  @doc """
+  Parses application cacertfile from env.
+  """
+  def cacertfile!(env) do
+    System.get_env(env)
+  end
+
+  @doc """
+  Parses application service name from env.
+  """
+  def app_service_name!(env) do
+    System.get_env(env)
+  end
+
+  @doc """
+  Parses application service url from env.
+  """
+  def app_service_url!(env) do
+    System.get_env(env)
+  end
+
+  @doc """
+  Parses update instructions url from env.
+  """
+  def update_instructions_url!(env) do
+    System.get_env(env)
+  end
+
+  @doc """
+  Parses iframe url from env.
+  """
+  def iframe_url!(env) do
+    System.get_env(env)
+  end
+
+  @doc """
+  Parses teams url from env.
+  """
+  def teams_url!(env) do
+    System.get_env(env)
+  end
+
+  @doc """
+  Parses agent name from env.
+  """
+  def agent_name!(env) do
+    if agent_name = System.get_env(env) do
+      unless agent_name =~ ~r/^[a-z0-9_\-]+$/ do
+        abort!(
+          "expected #{env} to consist of lowercase alphanumeric characters, dashes and underscores, got: #{agent_name}"
+        )
+      end
+
+      agent_name
+    end
   end
 
   @doc """
   Parses and validates default runtime from env.
   """
   def default_runtime!(env) do
-    if runtime = System.get_env(env) do
-      default_runtime!(env, runtime)
-    end
-  end
+    case System.get_env(env) do
+      nil ->
+        nil
 
-  @doc """
-  Parses and validates default runtime within context.
-  """
-  def default_runtime!(context, runtime) do
-    case runtime do
       "standalone" ->
-        {Livebook.Runtime.ElixirStandalone, []}
+        Livebook.Runtime.Standalone.new()
 
       "embedded" ->
-        {Livebook.Runtime.Embedded, []}
-
-      "mix" ->
-        case mix_path(File.cwd!()) do
-          {:ok, path} ->
-            {Livebook.Runtime.MixStandalone, [path]}
-
-          :error ->
-            abort!(
-              "the current directory is not a Mix project, make sure to specify the path explicitly with mix:path"
-            )
-        end
-
-      "mix:" <> path ->
-        case mix_path(path) do
-          {:ok, path} ->
-            {Livebook.Runtime.MixStandalone, [path]}
-
-          :error ->
-            abort!(~s{"#{path}" does not point to a Mix project})
-        end
+        Livebook.Runtime.Embedded.new()
 
       "attached:" <> config ->
         {node, cookie} = parse_connection_config!(config)
-        {Livebook.Runtime.Attached, [node, cookie]}
+        Livebook.Runtime.Attached.new(node, cookie)
 
       other ->
         abort!(
-          ~s{expected #{context} to be either "standalone", "mix[:path]" or "embedded", got: #{inspect(other)}}
+          ~s{expected #{env} to be either "standalone", "attached:node:cookie" or "embedded", got: #{inspect(other)}}
         )
     end
   end
 
-  defp mix_path(path) do
-    path = Path.expand(path)
-    mixfile = Path.join(path, "mix.exs")
-
-    if File.exists?(mixfile) do
-      {:ok, path}
-    else
-      :error
-    end
-  end
-
   defp parse_connection_config!(config) do
-    {node, cookie} = split_at_last_occurrence(config, ":")
-
-    unless node =~ "@" do
-      abort!(~s{expected node to include hostname, got: #{inspect(node)}})
-    end
+    {:ok, node, cookie} = Livebook.Utils.split_at_last_occurrence(config, ":")
 
     node = String.to_atom(node)
     cookie = String.to_atom(cookie)
@@ -250,76 +678,81 @@ defmodule Livebook.Config do
     {node, cookie}
   end
 
-  defp split_at_last_occurrence(string, pattern) do
-    {idx, 1} = string |> :binary.matches(pattern) |> List.last()
-
-    {
-      binary_part(string, 0, idx),
-      binary_part(string, idx + 1, byte_size(string) - idx - 1)
-    }
-  end
-
   @doc """
-  Parses file systems list.
-
-  Appends subsequent numbers to the given env prefix (starting from 1)
-  and parses the env variables until `nil` is encountered.
+  Parses and validates apps warmup mode from env.
   """
-  def file_systems!(env_prefix) do
-    Stream.iterate(1, &(&1 + 1))
-    |> Stream.map(fn n ->
-      env = env_prefix <> Integer.to_string(n)
-      System.get_env(env)
-    end)
-    |> Stream.take_while(& &1)
-    |> Enum.map(&parse_file_system!/1)
-  end
+  def apps_path_warmup!(env) do
+    case System.get_env(env) do
+      nil ->
+        nil
 
-  defp parse_file_system!(string) do
-    case string do
-      "s3 " <> config ->
-        FileSystem.S3.from_config_string(config)
+      "auto" ->
+        :auto
 
-      _ ->
-        abort!(
-          ~s{unrecognised file system, expected "s3 BUCKET_URL ACCESS_KEY_ID SECRET_ACCESS_KEY", got: #{inspect(string)}}
-        )
-    end
-    |> case do
-      {:ok, file_system} -> file_system
-      {:error, message} -> abort!(message)
+      "manual" ->
+        :manual
+
+      other ->
+        abort!(~s{expected #{env} to be either "auto" or "manual", got: #{inspect(other)}})
     end
   end
 
   @doc """
-  Returns environment variables configuration corresponding
-  to the given file systems.
-
-  The first (default) file system is ignored.
+  Parses and validates allowed URI schemes from env.
   """
-  def file_systems_as_env(file_systems)
-
-  def file_systems_as_env([_ | additional_file_systems]) do
-    additional_file_systems
-    |> Enum.with_index(1)
-    |> Enum.map(fn {file_system, n} ->
-      config = file_system_to_config_string(file_system)
-      ["LIVEBOOK_FILE_SYSTEM_", Integer.to_string(n), "=", ?", config, ?"]
-    end)
-    |> Enum.intersperse(" ")
-    |> IO.iodata_to_binary()
-  end
-
-  defp file_system_to_config_string(%FileSystem.S3{} = file_system) do
-    ["s3 ", FileSystem.S3.to_config_string(file_system)]
+  def allowed_uri_schemes!(env) do
+    if schemes = System.get_env(env) do
+      String.split(schemes, ",", trim: true)
+    end
   end
 
   @doc """
-  Aborts booting due to a configuration error.
+  Parses and validates DNS cluster query from env.
   """
-  @spec abort!(String.t()) :: no_return()
-  def abort!(message) do
-    IO.puts("\nERROR!!! [Livebook] " <> message)
-    System.halt(1)
+  def dns_cluster_query!(env) do
+    if cluster_config = System.get_env(env) do
+      case cluster_config do
+        "dns:" <> query ->
+          query
+
+        other ->
+          abort!(~s{expected #{env} to be "dns:query", got: #{inspect(other)}})
+      end
+    end
+  end
+
+  @identity_providers %{
+    "basic_auth" => Livebook.ZTA.BasicAuth,
+    "cloudflare" => Livebook.ZTA.Cloudflare,
+    "google_iap" => Livebook.ZTA.GoogleIAP,
+    "tailscale" => Livebook.ZTA.Tailscale
+  }
+
+  @doc """
+  Parses zero trust identity provider from env.
+  """
+  def identity_provider!(env) do
+    case System.get_env(env) do
+      nil ->
+        nil
+
+      "custom:" <> module_key ->
+        destructure [module, key], String.split(module_key, ":", parts: 2)
+        module = Module.concat([module])
+
+        if Code.ensure_loaded?(module) do
+          {:custom, module, key}
+        else
+          abort!("module given as custom identity provider in #{env} could not be found")
+        end
+
+      provider ->
+        with [type, key] <- String.split(provider, ":", parts: 2),
+             %{^type => module} <- @identity_providers do
+          {:zta, module, key}
+        else
+          _ -> abort!("invalid configuration for identity provider given in #{env}")
+        end
+    end
   end
 end

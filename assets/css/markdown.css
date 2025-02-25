@@ -115,17 +115,16 @@
 
 .markdown code {
   @apply py-[0.1rem] px-2 rounded-lg text-sm align-middle font-mono bg-gray-200;
+  font-variant-ligatures: none;
 }
 
 .markdown pre {
-  @apply flex overflow-hidden;
+  @apply my-4 flex overflow-hidden;
 }
 
 .markdown pre > code {
-  @apply p-4 rounded-lg text-sm align-middle font-mono flex-1 overflow-auto;
   /* Match the editor colors */
-  background-color: #282c34;
-  color: #abb2bf;
+  @apply p-4 rounded-lg align-middle flex-1 overflow-auto bg-editor text-editor font-editor;
 }
 
 .markdown kbd {
@@ -147,13 +146,13 @@
 
 /* Overrides for user-entered markdown */
 
-[data-element="cell"][data-type="markdown"] .markdown h1,
-[data-element="cell"][data-type="markdown"] .markdown h2 {
+[data-el-cell][data-type="markdown"] .markdown h1,
+[data-el-cell][data-type="markdown"] .markdown h2 {
   font-size: 0;
 }
 
-[data-element="cell"][data-type="markdown"] .markdown h1:after,
-[data-element="cell"][data-type="markdown"] .markdown h2:after {
+[data-el-cell][data-type="markdown"] .markdown h1:after,
+[data-el-cell][data-type="markdown"] .markdown h2:after {
   @apply text-red-400 text-base font-medium;
   content: "warning: heading levels 1 and 2 are reserved for notebook and section names, please use heading 3 and above.";
 }

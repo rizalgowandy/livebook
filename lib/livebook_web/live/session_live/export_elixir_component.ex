@@ -1,6 +1,8 @@
 defmodule LivebookWeb.SessionLive.ExportElixirComponent do
   use LivebookWeb, :live_component
 
+  alias Livebook.Session
+
   @impl true
   def update(assigns, socket) do
     socket = assign(socket, assigns)
@@ -15,42 +17,32 @@ defmodule LivebookWeb.SessionLive.ExportElixirComponent do
   def render(assigns) do
     ~H"""
     <div class="flex flex-col space-y-6">
-      <p class="text-gray-700">
-        <span class="font-semibold">Note:</span>
-        the script export is available as a convenience, rather than
-        an exact reproduction of the notebook and in some cases it may
-        not even compile. For example, if you define a macro in one cell
-        and import it in another cell, it works fine in Livebook,
-        because each cell is compiled separately. However, when running
-        the script it gets compiled as a whole and consequently doing so
-        doesn't work. Additionally, branching sections are commented out.
-      </p>
       <div class="flex flex-col space-y-1">
         <div class="flex justify-between items-center">
           <span class="text-sm text-gray-700 font-semibold">
-            .exs
+            {Session.file_name_for_download(@session) <> ".exs"}
           </span>
           <div class="flex justify-end space-x-2">
             <span class="tooltip left" data-tooltip="Copy source">
-              <button class="icon-button"
+              <.icon_button
                 aria-label="copy source"
-                phx-click={JS.dispatch("lb:clipcopy", to: "#export-notebook-source")}>
-                <.remix_icon icon="clipboard-line" class="text-lg" />
-              </button>
+                phx-click={JS.dispatch("lb:clipcopy", to: "#export-notebook-source")}
+              >
+                <.remix_icon icon="clipboard-line" />
+              </.icon_button>
             </span>
             <span class="tooltip left" data-tooltip="Download source">
-              <a class="icon-button"
+              <.icon_button
                 aria-label="download source"
-                href={Routes.session_path(@socket, :download_source, @session.id, "exs")}>
-                <.remix_icon icon="download-2-line" class="text-lg" />
-              </a>
+                href={~p"/sessions/#{@session.id}/download/export/exs"}
+                download
+              >
+                <.remix_icon icon="download-2-line" />
+              </.icon_button>
             </span>
           </div>
         </div>
-        <.code_preview
-          source_id="export-notebook-source"
-          language="elixir"
-          source={@source} />
+        <.code_preview source_id="export-notebook-source" language="elixir" source={@source} />
       </div>
     </div>
     """

@@ -1,6 +1,8 @@
 defmodule LivebookWeb.SessionLive.BinComponent do
   use LivebookWeb, :live_component
 
+  import LivebookWeb.NotebookComponents
+
   alias Livebook.Notebook.Cell
 
   @initial_limit 10
@@ -15,12 +17,6 @@ defmodule LivebookWeb.SessionLive.BinComponent do
   def update(assigns, socket) do
     {bin_entries, assigns} = Map.pop(assigns, :bin_entries)
 
-    # Only show text cells, as they have an actual content
-    bin_entries =
-      Enum.filter(bin_entries, fn entry ->
-        Cell.type(entry.cell) in [:markdown, :elixir]
-      end)
-
     {:ok,
      socket
      |> assign(:bin_entries, bin_entries)
@@ -31,87 +27,128 @@ defmodule LivebookWeb.SessionLive.BinComponent do
   @impl true
   def render(assigns) do
     ~H"""
-    <div class="p-6 max-w-4xl flex flex-col space-y-3">
+    <div class="flex flex-col space-y-3">
       <h3 class="text-2xl font-semibold text-gray-800">
         Bin
       </h3>
       <div class="w-full flex-col space-y-5">
-        <p class="text-gray-700">
-          Here you can find all the deleted cells from this notebook session.
-        </p>
-        <%= if @bin_entries == [] do %>
-          <div class="p-5 flex space-x-4 items-center border border-gray-200 rounded-lg">
-            <div>
-              <.remix_icon icon="windy-line" class="text-gray-400 text-xl" />
-            </div>
-            <div class="text-gray-600">
-              There are currently no cells in the bin.
-            </div>
-          </div>
-        <% else %>
-          <form phx-change="search" onsubmit="return false" phx-target={@myself}>
-            <input class="input"
-              type="text"
+        <div class="flex justify-between items-center">
+          <p class="text-gray-700 basis-4/5">
+            Find all your deleted cells from this notebook session
+          </p>
+          <form
+            :if={@bin_entries != []}
+            phx-change="search"
+            phx-nosubmit
+            phx-target={@myself}
+            class="mt-1 relative"
+          >
+            <span class="absolute inset-y-0 left-0 pl-3 flex items-center">
+              <.remix_icon icon="search-line" class="align-bottom text-gray-500" />
+            </span>
+            <.text_field
+              class="pl-10"
               name="search"
               value={@search}
               placeholder="Search"
               autocomplete="off"
               spellcheck="false"
-              autofocus />
+              autofocus
+            />
           </form>
-          <div class="flex flex-col space-y-8 min-h-[30rem] pt-3">
-            <%= for {%{cell: cell} = entry, index} <- Enum.take(@matching_entries, @limit) |> Enum.with_index(1) do %>
-              <div class="flex flex-col space-y-1">
+        </div>
+        <%= cond do %>
+          <% @bin_entries == [] -> %>
+            <div class="p-5 py-24 flex flex-col gap-3 space-x-4 items-center">
+              <div>
+                <.remix_icon
+                  icon="delete-bin-6-line"
+                  class="text-gray-700 text-xl bg-gray-100 p-3 rounded-full"
+                />
+              </div>
+              <div class="w-64 text-gray-600 text-center">
+                You haven't deleted any cells or sections yet. Once you do, they'll appear here.
+              </div>
+            </div>
+          <% @matching_entries == [] -> %>
+            <div class="p-5 py-24 flex flex-col gap-3 space-x-4 items-center">
+              <div>
+                <.remix_icon
+                  icon="file-search-line"
+                  class="text-gray-700 text-xl bg-gray-100 p-3 rounded-full"
+                />
+              </div>
+              <div class="w-64 text-gray-600 text-center">
+                We couldn't find any results for your query.
+              </div>
+            </div>
+          <% true -> %>
+            <div class="flex flex-col space-y-8 min-h-[30rem] pt-3">
+              <div
+                :for={%{cell: cell} = entry <- Enum.take(@matching_entries, @limit)}
+                class="flex flex-col space-y-1"
+              >
                 <div class="flex justify-between items-center">
-                  <p class="text-sm text-gray-700">
-                    <%= index %>.
-                    <span class="font-semibold"><%= Cell.type(cell) |> Atom.to_string() |> String.capitalize() %></span> cell
-                    deleted from <span class="font-semibold">“<%= entry.section_name %>”</span> section
-                    <span class="font-semibold"><%= format_date_relatively(entry.deleted_at) %></span>
-                  </p>
+                  <div class="flex py-1">
+                    <.cell_icon cell_type={Cell.type(cell)} language={Map.get(cell, :language)} />
+                    <p class="ml-1 text-sm text-gray-700 self-center">
+                      <span class="font-semibold">
+                        {Cell.type(cell) |> Atom.to_string() |> String.capitalize()}
+                      </span>
+                      cell
+                      deleted from <span class="font-semibold">“{entry.section_name}”</span>
+                      section
+                    </p>
+                  </div>
                   <div class="flex justify-end space-x-2">
-                    <span class="tooltip left" data-tooltip="Copy source">
-                      <button class="icon-button"
-                        aria-label="copy source"
-                        phx-click={JS.dispatch("lb:clipcopy", to: "#bin-cell-#{cell.id}-source")}>
-                        <.remix_icon icon="clipboard-line" class="text-lg" />
-                      </button>
-                    </span>
-                    <span class="tooltip left" data-tooltip="Restore">
-                      <button class="icon-button"
-                        aria-label="restore"
-                        phx-click="restore"
-                        phx-value-cell_id={entry.cell.id}
-                        phx-target={@myself}>
-                        <.remix_icon icon="arrow-go-back-line" class="text-lg" />
-                      </button>
+                    <span class="text-sm text-gray-500">
+                      {LivebookWeb.HTMLHelpers.format_datetime_relatively(entry.deleted_at)} ago
                     </span>
                   </div>
                 </div>
                 <.code_preview
                   source_id={"bin-cell-#{cell.id}-source"}
-                  language={Cell.type(cell)}
-                  source={cell.source} />
+                  language={cell_language(cell)}
+                  source={cell.source}
+                />
+                <div class="pt-1 pb-4 border-b border-gray-200">
+                  <.button
+                    color="gray"
+                    small
+                    aria-label="restore"
+                    phx-click="restore"
+                    phx-value-cell_id={entry.cell.id}
+                    phx-target={@myself}
+                  >
+                    <.remix_icon icon="arrow-go-back-line" />
+                    <span>Restore</span>
+                  </.button>
+                  <.button
+                    color="gray"
+                    small
+                    aria-label="copy source"
+                    phx-click={JS.dispatch("lb:clipcopy", to: "#bin-cell-#{cell.id}-source")}
+                  >
+                    <.remix_icon icon="clipboard-line" />
+                    <span>Copy source</span>
+                  </.button>
+                </div>
               </div>
-            <% end %>
-            <%= if length(@matching_entries) > @limit do %>
-              <div class="flex justify-center">
-                <button class="button button-outlined-gray" phx-click="more" phx-target={@myself}>
+              <div :if={length(@matching_entries) > @limit} class="flex justify-center">
+                <.button color="gray" outlined phx-click="more" phx-target={@myself}>
                   Older
-                </button>
+                </.button>
               </div>
-            <% end %>
-          </div>
+            </div>
         <% end %>
       </div>
     </div>
     """
   end
 
-  defp format_date_relatively(date) do
-    time_words = date |> DateTime.to_naive() |> Livebook.Utils.Time.time_ago_in_words()
-    time_words <> " ago"
-  end
+  defp cell_language(%Cell.Markdown{}), do: "markdown"
+  defp cell_language(%Cell.Code{language: language}), do: Atom.to_string(language)
+  defp cell_language(%Cell.Smart{}), do: "elixir"
 
   @impl true
   def handle_event("search", %{"search" => search}, socket) do

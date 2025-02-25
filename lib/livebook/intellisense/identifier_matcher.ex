@@ -1,72 +1,174 @@
 defmodule Livebook.Intellisense.IdentifierMatcher do
-  @moduledoc false
+  # This module allows for extracting information about identifiers
+  # based on code and runtime information (binding, environment).
+  #
+  # This functionality is a basic building block to be used for code
+  # completion and information extraction.
+  #
+  # The implementation is based primarily on `IEx.Autocomplete`. It
+  # also takes insights from `ElixirSense.Providers.Suggestion.Complete`,
+  # which is a very extensive implementation used in the Elixir Language
+  # Server.
 
-  # This module allows for extracting information about
-  # identifiers based on code and runtime information
-  # (binding, environment).
-  #
-  # This functionality is a basic building block to be
-  # used for code completion and information extraction.
-  #
-  # The implementation is based primarily on `IEx.Autocomplete`.
-  # It also takes insights from `ElixirSense.Providers.Suggestion.Complete`,
-  # which is a very extensive implementation used in the
-  # Elixir Language Server.
+  alias Livebook.Intellisense
+  alias Livebook.Intellisense.Docs
 
   @typedoc """
   A single identifier together with relevant information.
   """
   @type identifier_item ::
-          {:variable, name(), value()}
-          | {:map_field, name(), value()}
-          | {:module, module(), name(), doc_content()}
-          | {:function, module(), name(), arity(), doc_content(), list(signature()), spec()}
-          | {:type, module(), name(), arity(), doc_content()}
-          | {:module_attribute, name(), doc_content()}
+          %{
+            kind: :variable,
+            name: name()
+          }
+          | %{
+              kind: :map_field,
+              name: name()
+            }
+          | %{
+              kind: :in_map_field,
+              name: name()
+            }
+          | %{
+              kind: :in_struct_field,
+              module: module(),
+              name: name(),
+              default: term()
+            }
+          | %{
+              kind: :module,
+              module: module(),
+              display_name: display_name(),
+              documentation: Docs.documentation()
+            }
+          | %{
+              kind: :function,
+              module: module(),
+              name: name(),
+              arity: arity(),
+              type: :function | :macro,
+              display_name: display_name(),
+              from_default: boolean(),
+              documentation: Docs.documentation(),
+              signatures: list(Docs.signature()),
+              specs: list(Docs.spec()),
+              meta: Docs.meta()
+            }
+          | %{
+              kind: :type,
+              module: module(),
+              name: name(),
+              arity: arity(),
+              documentation: Docs.documentation(),
+              type_spec: Docs.type_spec()
+            }
+          | %{
+              kind: :module_attribute,
+              name: name(),
+              documentation: Docs.documentation()
+            }
+          | %{
+              kind: :bitstring_modifier,
+              name: name(),
+              arity: integer()
+            }
 
-  @type name :: String.t()
-  @type value :: term()
-  @type doc_content :: {format :: String.t(), content :: String.t()} | :hidden | nil
-  @type signature :: String.t()
-  @type spec :: tuple() | nil
+  @type name :: atom()
+  @type display_name :: String.t()
 
   @exact_matcher &Kernel.==/2
   @prefix_matcher &String.starts_with?/2
 
+  @bitstring_modifiers [
+    {:big, 0},
+    {:binary, 0},
+    {:bitstring, 0},
+    {:integer, 0},
+    {:float, 0},
+    {:little, 0},
+    {:native, 0},
+    {:signed, 0},
+    {:size, 1},
+    {:unit, 1},
+    {:unsigned, 0},
+    {:utf8, 0},
+    {:utf16, 0},
+    {:utf32, 0}
+  ]
+
+  @alias_only_atoms ~w(alias import require)a
+  @alias_only_charlists ~w(alias import require)c
+
   @doc """
-  Returns a list of identifiers matching the given `hint`
-  together with relevant information.
+  Clears all loaded entries stored for node.
+  """
+  def clear_all_loaded(node) do
+    :persistent_term.erase({__MODULE__, node})
+  end
+
+  defp cached_all_loaded(node) do
+    case :persistent_term.get({__MODULE__, node}, :error) do
+      :error ->
+        modules = Enum.map(:erpc.call(node, :code, :all_loaded, []), &elem(&1, 0))
+        :persistent_term.put({__MODULE__, node}, modules)
+        modules
+
+      [_ | _] = modules ->
+        modules
+    end
+  end
+
+  @doc """
+  Returns a list of identifiers matching the given `hint` together
+  with relevant information.
 
   Evaluation binding and environment is used to expand aliases,
   imports, nested maps, etc.
 
   `hint` may be a single token or line fragment like `if Enum.m`.
   """
-  @spec completion_identifiers(String.t(), Code.binding(), Macro.Env.t()) ::
+  @spec completion_identifiers(String.t(), Intellisense.context(), node()) ::
           list(identifier_item())
-  def completion_identifiers(hint, binding, env) do
-    context = cursor_context(hint)
-    ctx = %{binding: binding, env: env, matcher: @prefix_matcher}
-    context_to_matches(context, ctx, :completion)
+  def completion_identifiers(hint, intellisense_context, node) do
+    context = Code.Fragment.cursor_context(hint)
+
+    ctx = %{
+      fragment: hint,
+      intellisense_context: intellisense_context,
+      matcher: @prefix_matcher,
+      type: :completion,
+      node: node
+    }
+
+    context_to_matches(context, ctx)
   end
 
   @doc """
-  Extracts information about an identifier found in `column`
-  in `line`.
+  Extracts information about an identifier found in `column` in
+  `line`.
 
   The function returns range of columns where the identifier
   is located and a list of matching identifier items.
   """
-  @spec locate_identifier(String.t(), pos_integer(), Code.binding(), Macro.Env.t()) ::
+  @spec locate_identifier(String.t(), pos_integer(), Intellisense.context(), node()) ::
           %{
             matches: list(identifier_item()),
             range: nil | %{from: pos_integer(), to: pos_integer()}
           }
-  def locate_identifier(line, column, binding, env) do
-    case surround_context(line, {1, column}) do
+  def locate_identifier(line, column, intellisense_context, node) do
+    case Code.Fragment.surround_context(line, {1, column}) do
       %{context: context, begin: {_, from}, end: {_, to}} ->
-        ctx = %{binding: binding, env: env, matcher: @exact_matcher}
-        matches = context_to_matches(context, ctx, :locate)
+        fragment = String.slice(line, 0, to - 1)
+
+        ctx = %{
+          fragment: fragment,
+          intellisense_context: intellisense_context,
+          matcher: @exact_matcher,
+          type: :locate,
+          node: node
+        }
+
+        matches = context_to_matches(context, ctx)
         %{matches: matches, range: %{from: from, to: to}}
 
       :none ->
@@ -77,7 +179,7 @@ defmodule Livebook.Intellisense.IdentifierMatcher do
   # Takes a context returned from Code.Fragment.cursor_context
   # or Code.Fragment.surround_context and looks up matching
   # identifier items
-  defp context_to_matches(context, ctx, type) do
+  defp context_to_matches(context, ctx) do
     case context do
       {:alias, alias} ->
         match_alias(List.to_string(alias), ctx, false)
@@ -86,7 +188,11 @@ defmodule Livebook.Intellisense.IdentifierMatcher do
         match_erlang_module(List.to_string(unquoted_atom), ctx)
 
       {:dot, path, hint} ->
-        match_dot(path, List.to_string(hint), ctx)
+        if alias = dot_alias_only(path, hint, ctx.fragment, ctx) do
+          match_alias(List.to_string(alias), ctx, false)
+        else
+          match_dot(path, List.to_string(hint), ctx)
+        end
 
       {:dot_arity, path, hint} ->
         match_dot(path, List.to_string(hint), %{ctx | matcher: @exact_matcher})
@@ -95,25 +201,36 @@ defmodule Livebook.Intellisense.IdentifierMatcher do
         match_default(ctx)
 
       :expr ->
-        match_default(ctx)
+        match_container_context(ctx.fragment, :expr, "", ctx) || match_default(ctx)
 
       {:local_or_var, local_or_var} ->
-        match_local_or_var(List.to_string(local_or_var), ctx)
+        hint = List.to_string(local_or_var)
+        match_container_context(ctx.fragment, :expr, hint, ctx) || match_local_or_var(hint, ctx)
 
       {:local_arity, local} ->
         match_local(List.to_string(local), %{ctx | matcher: @exact_matcher})
 
+      {:local_call, local} when local in @alias_only_charlists ->
+        match_alias("", ctx, false)
+
       {:local_call, local} ->
-        case type do
+        case ctx.type do
           :completion -> match_default(ctx)
           :locate -> match_local(List.to_string(local), %{ctx | matcher: @exact_matcher})
         end
+
+      {:operator, operator} when operator in ~w(:: -)c ->
+        match_container_context(ctx.fragment, :operator, "", ctx) ||
+          match_local_or_var(List.to_string(operator), ctx)
 
       {:operator, operator} ->
         match_local_or_var(List.to_string(operator), ctx)
 
       {:operator_arity, operator} ->
         match_local(List.to_string(operator), %{ctx | matcher: @exact_matcher})
+
+      {:operator_call, operator} when operator in ~w(|)c ->
+        match_container_context(ctx.fragment, :expr, "", ctx) || match_default(ctx)
 
       {:operator_call, _operator} ->
         match_default(ctx)
@@ -152,10 +269,6 @@ defmodule Livebook.Intellisense.IdentifierMatcher do
     end
   end
 
-  defp expand_dot_path({:var, var}, ctx) do
-    Keyword.fetch(ctx.binding, List.to_atom(var))
-  end
-
   defp expand_dot_path({:alias, alias}, ctx) do
     {:ok, expand_alias(List.to_string(alias), ctx)}
   end
@@ -168,10 +281,36 @@ defmodule Livebook.Intellisense.IdentifierMatcher do
     :error
   end
 
-  defp expand_dot_path({:dot, parent, call}, ctx) do
-    case expand_dot_path(parent, ctx) do
-      {:ok, %{} = map} -> Map.fetch(map, List.to_atom(call))
-      _ -> :error
+  defp expand_dot_path(path, ctx) do
+    with {:ok, path} <- recur_expand_dot_path(path, []) do
+      value_from_binding(path, ctx)
+    end
+  end
+
+  defp recur_expand_dot_path({:var, var}, path) do
+    {:ok, [List.to_atom(var) | path]}
+  end
+
+  defp recur_expand_dot_path({:dot, parent, call}, path) do
+    recur_expand_dot_path(parent, [List.to_atom(call) | path])
+  end
+
+  defp recur_expand_dot_path(_, _path) do
+    :error
+  end
+
+  defp value_from_binding([var | map_path], ctx) do
+    if Macro.Env.has_var?(ctx.intellisense_context.env, {var, nil}) do
+      ctx.intellisense_context.map_binding.(fn binding ->
+        value = Keyword.fetch(binding, var)
+
+        Enum.reduce(map_path, value, fn
+          key, {:ok, map} when is_map(map) -> Map.fetch(map, key)
+          _key, _acc -> :error
+        end)
+      end)
+    else
+      :error
     end
   end
 
@@ -190,19 +329,152 @@ defmodule Livebook.Intellisense.IdentifierMatcher do
     end
   end
 
+  defp dot_alias_only(path, hint, code, ctx) do
+    with {:alias, alias} <- path,
+         [] <- hint,
+         :alias_only <- container_context(code, ctx) do
+      alias ++ [?.]
+    else
+      _ -> nil
+    end
+  end
+
+  # This is ignoring information from remote nodes
+  # and only listing structs that are also structs
+  # in the current node. Doing this check remotely
+  # would unfortunately be too expensive. Alternatively
+  # we list all modules.
   defp match_struct(hint, ctx) do
-    for {:module, module, name, doc_content} <- match_alias(hint, ctx, true),
+    for %{kind: :module, module: module} = item <- match_alias(hint, ctx, true),
         has_struct?(module),
-        do: {:module, module, name, doc_content}
+        not is_exception?(module),
+        do: item
   end
 
   defp has_struct?(mod) do
-    Code.ensure_loaded?(mod) and function_exported?(mod, :__struct__, 1) and
-      not function_exported?(mod, :exception, 1)
+    Code.ensure_loaded?(mod) and function_exported?(mod, :__struct__, 1)
+  end
+
+  defp is_exception?(mod) do
+    Code.ensure_loaded?(mod) and function_exported?(mod, :exception, 1)
   end
 
   defp match_module_member(mod, hint, ctx) do
     match_module_function(mod, hint, ctx) ++ match_module_type(mod, hint, ctx)
+  end
+
+  defp match_container_context(code, context, hint, ctx) do
+    case container_context(code, ctx) do
+      {:map, map, pairs} when context == :expr ->
+        container_context_map_fields(pairs, map, hint, ctx)
+
+      {:struct, alias, pairs} when context == :expr ->
+        container_context_struct_fields(pairs, alias, hint, ctx)
+
+      :bitstring_modifier ->
+        existing = code |> String.split("::") |> List.last() |> String.split("-")
+
+        for {modifier, arity} <- @bitstring_modifiers,
+            name = Atom.to_string(modifier),
+            String.starts_with?(name, hint) and name not in existing,
+            do: %{kind: :bitstring_modifier, name: modifier, arity: arity}
+
+      _ ->
+        nil
+    end
+  end
+
+  defp container_context(code, ctx) do
+    case Code.Fragment.container_cursor_to_quoted(code) do
+      {:ok, quoted} ->
+        case Macro.path(quoted, &match?({:__cursor__, _, []}, &1)) do
+          [cursor, {:%{}, _, pairs}, {:%, _, [{:__aliases__, _, aliases}, _map]} | _] ->
+            container_context_struct(cursor, pairs, aliases, ctx)
+
+          [
+            cursor,
+            pairs,
+            {:|, _, _},
+            {:%{}, _, _},
+            {:%, _, [{:__aliases__, _, aliases}, _map]} | _
+          ] ->
+            container_context_struct(cursor, pairs, aliases, ctx)
+
+          [cursor, pairs, {:|, _, [{variable, _, nil} | _]}, {:%{}, _, _} | _] ->
+            container_context_map(cursor, pairs, variable, ctx)
+
+          [cursor, {special_form, _, [cursor]} | _] when special_form in @alias_only_atoms ->
+            :alias_only
+
+          [cursor | tail] ->
+            case remove_operators(tail, cursor) do
+              [{:"::", _, [_, _]}, {:<<>>, _, [_ | _]} | _] -> :bitstring_modifier
+              _ -> nil
+            end
+
+          _ ->
+            nil
+        end
+
+      {:error, _} ->
+        nil
+    end
+  end
+
+  defp remove_operators([{op, _, [_, previous]} = head | tail], previous) when op in [:-],
+    do: remove_operators(tail, head)
+
+  defp remove_operators(tail, _previous),
+    do: tail
+
+  defp container_context_struct(cursor, pairs, aliases, ctx) do
+    with {pairs, [^cursor]} <- Enum.split(pairs, -1),
+         alias = expand_alias(aliases, ctx),
+         true <- Keyword.keyword?(pairs) and has_struct?(alias) do
+      {:struct, alias, pairs}
+    else
+      _ -> nil
+    end
+  end
+
+  defp container_context_map(cursor, pairs, variable, ctx) do
+    with {pairs, [^cursor]} <- Enum.split(pairs, -1),
+         {:ok, map} when is_map(map) <- value_from_binding([variable], ctx),
+         true <- Keyword.keyword?(pairs) do
+      {:map, map, pairs}
+    else
+      _ -> nil
+    end
+  end
+
+  defp container_context_map_fields(pairs, map, hint, ctx) do
+    map = filter_out_fields(map, pairs)
+
+    for {key, _value} <- map,
+        name = Atom.to_string(key),
+        ctx.matcher.(name, hint),
+        do: %{kind: :in_map_field, name: key}
+  end
+
+  defp container_context_struct_fields(pairs, mod, hint, ctx) do
+    map = Map.from_struct(mod.__struct__())
+    map = filter_out_fields(map, pairs)
+
+    for {field, default} <- map,
+        name = Atom.to_string(field),
+        ctx.matcher.(name, hint),
+        do: %{kind: :in_struct_field, struct: mod, name: field, default: default}
+  end
+
+  defp filter_out_fields(map, pairs) do
+    # Remove the keys that have already been filled, and internal keys
+    map
+    |> Map.drop(Keyword.keys(pairs))
+    |> Map.reject(fn {key, _} ->
+      key
+      |> Atom.to_string()
+      |> String.starts_with?("_")
+    end)
   end
 
   defp match_local_or_var(hint, ctx) do
@@ -211,7 +483,7 @@ defmodule Livebook.Intellisense.IdentifierMatcher do
 
   defp match_local(hint, ctx) do
     imports =
-      ctx.env
+      ctx.intellisense_context.env
       |> imports_from_env()
       |> Enum.flat_map(fn {mod, funs} ->
         match_module_function(mod, hint, ctx, funs)
@@ -223,52 +495,62 @@ defmodule Livebook.Intellisense.IdentifierMatcher do
   end
 
   defp match_variable(hint, ctx) do
-    for {key, value} <- ctx.binding,
-        is_atom(key),
-        name = Atom.to_string(key),
+    for {var, nil} <- Macro.Env.vars(ctx.intellisense_context.env),
+        name = Atom.to_string(var),
         ctx.matcher.(name, hint),
-        do: {:variable, name, value}
+        do: %{kind: :variable, name: var}
   end
 
   defp match_map_field(map, hint, ctx) do
     # Note: we need Map.to_list/1 in case this is a struct
-    for {key, value} <- Map.to_list(map),
+    for {key, _value} <- Map.to_list(map),
         is_atom(key),
         name = Atom.to_string(key),
         ctx.matcher.(name, hint),
-        do: {:map_field, name, value}
+        do: %{kind: :map_field, name: key}
   end
 
   defp match_sigil(hint, ctx) do
-    for {:function, module, "sigil_" <> sigil_name, arity, doc_content, signatures, spec} <-
+    for %{kind: :function, display_name: "sigil_" <> sigil_name} = item <-
           match_local("sigil_", %{ctx | matcher: @prefix_matcher}),
         ctx.matcher.(sigil_name, hint),
-        do: {:function, module, "~" <> sigil_name, arity, doc_content, signatures, spec}
+        do: %{item | display_name: "~" <> sigil_name}
   end
 
   defp match_erlang_module(hint, ctx) do
     for mod <- get_matching_modules(hint, ctx),
         usable_as_unquoted_module?(mod),
         name = ":" <> Atom.to_string(mod),
-        do: {:module, mod, name, get_module_doc_content(mod)}
+        do: %{
+          kind: :module,
+          module: mod,
+          display_name: name,
+          documentation: Intellisense.Docs.get_module_documentation(mod, ctx.node)
+        }
   end
 
   # Converts alias string to module atom with regard to the given env
-  defp expand_alias(alias, ctx) do
-    [name | rest] = alias |> String.split(".") |> Enum.map(&String.to_atom/1)
+  defp expand_alias(alias, ctx) when is_binary(alias) do
+    alias
+    |> String.split(".")
+    |> Enum.map(&String.to_atom/1)
+    |> expand_alias(ctx)
+  end
 
-    case Keyword.fetch(ctx.env.aliases, Module.concat(Elixir, name)) do
-      {:ok, name} when rest == [] -> name
-      {:ok, name} -> Module.concat([name | rest])
-      :error -> Module.concat([name | rest])
-    end
+  defp expand_alias([_ | _] = parts, ctx) do
+    Macro.expand({:__aliases__, [], parts}, ctx.intellisense_context.env)
   end
 
   defp match_env_alias(hint, ctx) do
-    for {alias, mod} <- ctx.env.aliases,
+    for {alias, mod} <- ctx.intellisense_context.env.aliases,
         [name] = Module.split(alias),
         ctx.matcher.(name, hint),
-        do: {:module, mod, name, get_module_doc_content(mod)}
+        do: %{
+          kind: :module,
+          module: mod,
+          display_name: name,
+          documentation: Intellisense.Docs.get_module_documentation(mod, ctx.node)
+        }
   end
 
   defp match_module(base_mod, hint, nested?, ctx) do
@@ -292,7 +574,7 @@ defmodule Livebook.Intellisense.IdentifierMatcher do
     # `Elixir` is not a existing module name, but `Elixir.Enum` is,
     # so if the user types `Eli` the completion should include `Elixir`.
     if ctx.matcher.("Elixir", hint) do
-      [{:module, Elixir, "Elixir", nil} | items]
+      [%{kind: :module, module: Elixir, display_name: "Elixir", documentation: nil} | items]
     else
       items
     end
@@ -317,7 +599,12 @@ defmodule Livebook.Intellisense.IdentifierMatcher do
         valid_alias_piece?("." <> name),
         mod = Module.concat(parent_mod_parts ++ name_parts),
         uniq: true,
-        do: {:module, mod, name, get_module_doc_content(mod)}
+        do: %{
+          kind: :module,
+          module: mod,
+          display_name: name,
+          documentation: Intellisense.Docs.get_module_documentation(mod, ctx.node)
+        }
   end
 
   defp valid_alias_piece?(<<?., char, rest::binary>>) when char in ?A..?Z,
@@ -336,153 +623,160 @@ defmodule Livebook.Intellisense.IdentifierMatcher do
   defp valid_alias_rest?(rest), do: valid_alias_piece?(rest)
 
   defp usable_as_unquoted_module?(mod) do
-    Code.Identifier.classify(mod) != :other
+    Macro.classify_atom(mod) in [:identifier, :unquoted]
   end
 
   defp get_matching_modules(hint, ctx) do
-    get_modules()
+    ctx
+    |> get_modules()
     |> Enum.filter(&ctx.matcher.(Atom.to_string(&1), hint))
     |> Enum.uniq()
   end
 
-  defp get_modules() do
-    modules = Enum.map(:code.all_loaded(), &elem(&1, 0))
-
-    case :code.get_mode() do
-      :interactive -> modules ++ get_modules_from_applications()
-      _otherwise -> modules
+  defp get_modules(%{node: node} = ctx) do
+    # On interactive mode, we load modules from the application
+    # and then the ones from runtime. For a remote node, ideally
+    # we would get the applications one, but there is no cheap
+    # way to do such, so we get :code.all_loaded and cache it
+    # instead (which includes all modules anyway on embedded mode).
+    if node == node() and :code.get_mode() == :interactive do
+      runtime_modules(ctx.intellisense_context.ebin_path) ++ get_modules_from_applications()
+    else
+      cached_all_loaded(node)
     end
   end
 
-  defp get_modules_from_applications do
-    for [app] <- loaded_applications(),
-        {:ok, modules} = :application.get_key(app, :modules),
-        module <- modules,
-        do: module
+  defp runtime_modules(path) do
+    with true <- is_binary(path),
+         {:ok, beams} <- File.ls(path) do
+      for beam <- beams, String.ends_with?(beam, ".beam") do
+        beam
+        |> binary_slice(0..-6//1)
+        |> String.to_atom()
+      end
+    else
+      _ -> []
+    end
   end
 
-  defp loaded_applications do
+  defp get_modules_from_applications() do
     # If we invoke :application.loaded_applications/0,
     # it can error if we don't call safe_fixtable before.
     # Since in both cases we are reaching over the
     # application controller internals, we choose to match
     # for performance.
-    :ets.match(:ac_tab, {{:loaded, :"$1"}, :_})
+    for [app] <- :ets.match(:ac_tab, {{:loaded, :"$1"}, :_}),
+        {:ok, modules} = :application.get_key(app, :modules),
+        module <- modules,
+        do: module
   end
 
   defp match_module_function(mod, hint, ctx, funs \\ nil) do
-    if ensure_loaded?(mod) do
-      {format, docs} = get_docs(mod, [:function, :macro])
-      specs = get_specs(mod)
-      funs = funs || exports(mod)
-      funs_with_base_arity = funs_with_base_arity(docs)
+    if ensure_loaded?(mod, ctx.node) do
+      funs = funs || exports(mod, ctx.node)
 
-      funs
-      |> Enum.filter(fn {name, _arity} ->
-        name = Atom.to_string(name)
-        ctx.matcher.(name, hint)
-      end)
-      |> Enum.map(fn {name, arity} ->
-        base_arity = Map.get(funs_with_base_arity, {name, arity}, arity)
-        doc = find_doc(docs, {name, base_arity})
-        spec = find_spec(specs, {name, base_arity})
+      matching_funs =
+        Enum.filter(funs, fn {name, _arity, _type} ->
+          name = Atom.to_string(name)
+          ctx.matcher.(name, hint)
+        end)
 
-        doc_content = doc_content(doc, format)
-        signatures = doc_signatures(doc)
+      doc_items =
+        Intellisense.Docs.lookup_module_members(
+          mod,
+          Enum.map(matching_funs, &Tuple.delete_at(&1, 2)),
+          ctx.node,
+          kinds: [:function, :macro]
+        )
 
-        {:function, mod, Atom.to_string(name), arity, doc_content, signatures, spec}
+      Enum.map(matching_funs, fn {name, arity, type} ->
+        doc_item =
+          Enum.find(
+            doc_items,
+            %{from_default: false, documentation: nil, signatures: [], specs: [], meta: %{}},
+            fn doc_item ->
+              doc_item.name == name && doc_item.arity == arity
+            end
+          )
+
+        %{
+          kind: :function,
+          module: mod,
+          name: name,
+          arity: arity,
+          type: type,
+          display_name: Atom.to_string(name),
+          from_default: doc_item.from_default,
+          documentation: doc_item.documentation,
+          signatures: doc_item.signatures,
+          specs: doc_item.specs,
+          meta: doc_item.meta
+        }
       end)
     else
       []
     end
   end
 
-  # If a function has default arguments it generates less-arity functions,
-  # but they have the same docs/specs as the original function.
-  # Here we build a map that given function {name, arity} returns its base arity.
-  defp funs_with_base_arity(docs) do
-    for {{_, fun_name, arity}, _, _, _, metadata} <- docs,
-        count = Map.get(metadata, :defaults, 0),
-        count > 0,
-        new_arity <- (arity - count)..(arity - 1),
-        into: %{},
-        do: {{fun_name, new_arity}, arity}
-  end
-
-  defp get_docs(mod, kinds) do
-    case Code.fetch_docs(mod) do
-      {:docs_v1, _, _, format, _, _, docs} ->
-        docs = for {{kind, _, _}, _, _, _, _} = doc <- docs, kind in kinds, do: doc
-        {format, docs}
-
-      _ ->
-        {nil, []}
-    end
-  end
-
-  defp get_module_doc_content(mod) do
-    case Code.fetch_docs(mod) do
-      {:docs_v1, _, _, format, %{"en" => docstring}, _, _} ->
-        {format, docstring}
-
-      {:docs_v1, _, _, _, :hidden, _, _} ->
-        :hidden
-
-      _ ->
-        nil
-    end
-  end
-
-  defp find_doc(docs, {name, arity}) do
-    Enum.find(docs, &match?({{_, ^name, ^arity}, _, _, _, _}, &1))
-  end
-
-  defp get_specs(mod) do
-    case Code.Typespec.fetch_specs(mod) do
-      {:ok, specs} -> specs
-      :error -> []
-    end
-  end
-
-  defp find_spec(specs, {name, arity}) do
-    Enum.find(specs, &match?({{^name, ^arity}, _}, &1))
-  end
-
-  defp doc_signatures({_, _, signatures, _, _}), do: signatures
-  defp doc_signatures(_), do: []
-
-  defp doc_content({_, _, _, %{"en" => docstr}, _}, format), do: {format, docstr}
-  defp doc_content({_, _, _, :hidden, _}, _format), do: :hidden
-  defp doc_content(_doc, _format), do: nil
-
-  defp exports(mod) do
-    if Code.ensure_loaded?(mod) and function_exported?(mod, :__info__, 1) do
-      mod.__info__(:macros) ++ (mod.__info__(:functions) -- [__info__: 1])
+  defp exports(mod, node) do
+    try do
+      :erpc.call(node, mod, :module_info, [:exports])
+    rescue
+      _ -> []
     else
-      mod.module_info(:exports) -- [module_info: 0, module_info: 1]
+      exports ->
+        for {fun, arity} <- exports,
+            not reflection?(fun, arity),
+            do: function_or_macro(Atom.to_string(fun), fun, arity)
     end
+  end
+
+  defp reflection?(:module_info, 0), do: true
+  defp reflection?(:module_info, 1), do: true
+  defp reflection?(:__info__, 1), do: true
+  defp reflection?(_, _), do: false
+
+  defp function_or_macro("MACRO-" <> name, _, arity),
+    do: {String.to_atom(name), arity - 1, :macro}
+
+  defp function_or_macro(_, fun, arity), do: {fun, arity, :function}
+
+  defp append_funs_type(funs, type) do
+    Enum.map(funs, fn {name, arity} -> {name, arity, type} end)
   end
 
   defp match_module_type(mod, hint, ctx) do
-    {format, docs} = get_docs(mod, [:type])
-    types = get_module_types(mod)
+    types = get_module_types(mod, ctx.node)
 
-    types
-    |> Enum.filter(fn {name, _arity} ->
-      name = Atom.to_string(name)
-      ctx.matcher.(name, hint)
-    end)
-    |> Enum.map(fn {name, arity} ->
-      doc = find_doc(docs, {name, arity})
-      doc_content = doc_content(doc, format)
+    matching_types =
+      Enum.filter(types, fn {name, _arity} ->
+        name = Atom.to_string(name)
+        ctx.matcher.(name, hint)
+      end)
 
-      {:type, mod, Atom.to_string(name), arity, doc_content}
+    doc_items =
+      Intellisense.Docs.lookup_module_members(mod, matching_types, ctx.node, kinds: [:type])
+
+    Enum.map(matching_types, fn {name, arity} ->
+      doc_item =
+        Enum.find(doc_items, %{documentation: nil, type_spec: nil}, fn doc_item ->
+          doc_item.name == name && doc_item.arity == arity
+        end)
+
+      %{
+        kind: :type,
+        module: mod,
+        name: name,
+        arity: arity,
+        documentation: doc_item.documentation,
+        type_spec: doc_item.type_spec
+      }
     end)
   end
 
-  defp get_module_types(mod) do
-    with true <- ensure_loaded?(mod),
-         {:ok, types} <- Code.Typespec.fetch_types(mod) do
+  defp get_module_types(mod, node) do
+    with true <- ensure_loaded?(mod, node),
+         {:ok, types} <- :erpc.call(node, Code.Typespec, :fetch_types, [mod]) do
       for {kind, {name, _, args}} <- types, kind in [:type, :opaque] do
         {name, length(args)}
       end
@@ -491,10 +785,20 @@ defmodule Livebook.Intellisense.IdentifierMatcher do
     end
   end
 
-  defp ensure_loaded?(Elixir), do: false
-  defp ensure_loaded?(mod), do: Code.ensure_loaded?(mod)
+  # Skip Elixir to avoid warnings
+  defp ensure_loaded?(Elixir, _node), do: false
+  # Remote nodes only have loaded modules
+  defp ensure_loaded?(_mod, node) when node != node(), do: true
+  defp ensure_loaded?(mod, _node), do: Code.ensure_loaded?(mod)
 
-  defp imports_from_env(env), do: env.functions ++ env.macros
+  defp imports_from_env(env) do
+    Enum.map(env.functions, fn {mod, funs} ->
+      {mod, append_funs_type(funs, :function)}
+    end) ++
+      Enum.map(env.macros, fn {mod, funs} ->
+        {mod, append_funs_type(funs, :macro)}
+      end)
+  end
 
   defp split_at_last_occurrence(string, pattern) do
     case :binary.matches(string, pattern) do
@@ -502,9 +806,9 @@ defmodule Livebook.Intellisense.IdentifierMatcher do
         :error
 
       parts ->
-        {start, _} = List.last(parts)
-        size = byte_size(string)
-        {:ok, binary_part(string, 0, start), binary_part(string, start + 1, size - start - 1)}
+        {start, length} = List.last(parts)
+        <<left::binary-size(start), _::binary-size(length), right::binary>> = string
+        {:ok, left, right}
     end
   end
 
@@ -512,740 +816,10 @@ defmodule Livebook.Intellisense.IdentifierMatcher do
     for {attribute, info} <- Module.reserved_attributes(),
         name = Atom.to_string(attribute),
         ctx.matcher.(name, hint),
-        do: {:module_attribute, name, {"text/markdown", info.doc}}
-  end
-
-  # ---
-  # Source of Code.Fragment
-
-  # TODO: no longer required on Elixir v1.13
-
-  # This module provides conveniences for analyzing fragments of
-  # textual code and extract available information whenever possible.
-
-  # Most of the functions in this module provide a best-effort
-  # and may not be accurate under all circumstances. Read each
-  # documentation for more information.
-
-  # This module should be considered experimental.
-
-  @type position :: {line :: pos_integer(), column :: pos_integer()}
-
-  @doc """
-  Receives a string and returns the cursor context.
-
-  This function receives a string with an Elixir code fragment,
-  representing a cursor position, and based on the string, it
-  provides contextual information about said position. The
-  return of this function can then be used to provide tips,
-  suggestions, and autocompletion functionality.
-
-  This function provides a best-effort detection and may not be
-  accurate under all circumstances. See the "Limitations"
-  section below.
-
-  Consider adding a catch-all clause when handling the return
-  type of this function as new cursor information may be added
-  in future releases.
-
-  ## Examples
-
-      iex> Code.Fragment.cursor_context("")
-      :expr
-
-      iex> Code.Fragment.cursor_context("hello_wor")
-      {:local_or_var, 'hello_wor'}
-
-  ## Return values
-
-    * `{:alias, charlist}` - the context is an alias, potentially
-      a nested one, such as `Hello.Wor` or `HelloWor`
-
-    * `{:dot, inside_dot, charlist}` - the context is a dot
-      where `inside_dot` is either a `{:var, charlist}`, `{:alias, charlist}`,
-      `{:module_attribute, charlist}`, `{:unquoted_atom, charlist}` or a `dot`
-      itself. If a var is given, this may either be a remote call or a map
-      field access. Examples are `Hello.wor`, `:hello.wor`, `hello.wor`,
-      `Hello.nested.wor`, `hello.nested.wor`, and `@hello.world`
-
-    * `{:dot_arity, inside_dot, charlist}` - the context is a dot arity
-      where `inside_dot` is either a `{:var, charlist}`, `{:alias, charlist}`,
-      `{:module_attribute, charlist}`, `{:unquoted_atom, charlist}` or a `dot`
-      itself. If a var is given, it must be a remote arity. Examples are
-      `Hello.world/`, `:hello.world/`, `hello.world/2`, and `@hello.world/2`
-
-    * `{:dot_call, inside_dot, charlist}` - the context is a dot
-      call. This means parentheses or space have been added after the expression.
-      where `inside_dot` is either a `{:var, charlist}`, `{:alias, charlist}`,
-      `{:module_attribute, charlist}`, `{:unquoted_atom, charlist}` or a `dot`
-      itself. If a var is given, it must be a remote call. Examples are
-      `Hello.world(`, `:hello.world(`, `Hello.world `, `hello.world(`, `hello.world `,
-      and `@hello.world(`
-
-    * `:expr` - may be any expression. Autocompletion may suggest an alias,
-      local or var
-
-    * `{:local_or_var, charlist}` - the context is a variable or a local
-      (import or local) call, such as `hello_wor`
-
-    * `{:local_arity, charlist}` - the context is a local (import or local)
-      arity, such as `hello_world/`
-
-    * `{:local_call, charlist}` - the context is a local (import or local)
-      call, such as `hello_world(` and `hello_world `
-
-    * `{:module_attribute, charlist}` - the context is a module attribute,
-      such as `@hello_wor`
-
-    * `{:operator, charlist}` - the context is an operator, such as `+` or
-      `==`. Note textual operators, such as `when` do not appear as operators
-      but rather as `:local_or_var`. `@` is never an `:operator` and always a
-      `:module_attribute`
-
-    * `{:operator_arity, charlist}` - the context is an operator arity, which
-      is an operator followed by /, such as `+/`, `not/` or `when/`
-
-    * `{:operator_call, charlist}` - the context is an operator call, which is
-      an operator followed by space, such as `left + `, `not ` or `x when `
-
-    * `:none` - no context possible
-
-    * `{:sigil, charlist}` - the context is a sigil. It may be either the beginning
-      of a sigil, such as `~` or `~s`, or an operator starting with `~`, such as
-      `~>` and `~>>`
-
-    * `{:struct, charlist}` - the context is a struct, such as `%`, `%UR` or `%URI`
-
-    * `{:unquoted_atom, charlist}` - the context is an unquoted atom. This
-      can be any atom or an atom representing a module
-
-  ## Limitations
-
-  The current algorithm only considers the last line of the input. This means
-  it will also show suggestions inside strings, heredocs, etc, which is
-  intentional as it helps with doctests, references, and more. Other functions
-  may be added in the future that consider the tree-structure of the code.
-  """
-  @doc since: "1.13.0"
-  @spec cursor_context(List.Chars.t(), keyword()) ::
-          {:alias, charlist}
-          | {:dot, inside_dot, charlist}
-          | {:dot_arity, inside_dot, charlist}
-          | {:dot_call, inside_dot, charlist}
-          | :expr
-          | {:local_or_var, charlist}
-          | {:local_arity, charlist}
-          | {:local_call, charlist}
-          | {:module_attribute, charlist}
-          | {:operator, charlist}
-          | {:operator_arity, charlist}
-          | {:operator_call, charlist}
-          | :none
-          | {:sigil, charlist}
-          | {:struct, charlist}
-          | {:unquoted_atom, charlist}
-        when inside_dot:
-               {:alias, charlist}
-               | {:dot, inside_dot, charlist}
-               | {:module_attribute, charlist}
-               | {:unquoted_atom, charlist}
-               | {:var, charlist}
-  def cursor_context(fragment, opts \\ [])
-
-  def cursor_context(binary, opts) when is_binary(binary) and is_list(opts) do
-    binary =
-      case :binary.matches(binary, "\n") do
-        [] ->
-          binary
-
-        matches ->
-          {position, _} = List.last(matches)
-          binary_part(binary, position + 1, byte_size(binary) - position - 1)
-      end
-
-    binary
-    |> String.to_charlist()
-    |> :lists.reverse()
-    |> codepoint_cursor_context(opts)
-    |> elem(0)
-  end
-
-  def cursor_context(charlist, opts) when is_list(charlist) and is_list(opts) do
-    charlist =
-      case charlist |> Enum.chunk_by(&(&1 == ?\n)) |> List.last([]) do
-        [?\n | _] -> []
-        rest -> rest
-      end
-
-    charlist
-    |> :lists.reverse()
-    |> codepoint_cursor_context(opts)
-    |> elem(0)
-  end
-
-  def cursor_context(other, opts) when is_list(opts) do
-    cursor_context(to_charlist(other), opts)
-  end
-
-  @operators '\\<>+-*/:=|&~^%!'
-  @starter_punctuation ',([{;'
-  @non_starter_punctuation ')]}"\'.$'
-  @space '\t\s'
-  @trailing_identifier '?!'
-  @tilde_op_prefix '<=~'
-
-  @non_identifier @trailing_identifier ++
-                    @operators ++ @starter_punctuation ++ @non_starter_punctuation ++ @space
-
-  @textual_operators ~w(when not and or in)c
-  @incomplete_operators ~w(^^ ~~ ~)c
-
-  defp codepoint_cursor_context(reverse, _opts) do
-    {stripped, spaces} = strip_spaces(reverse, 0)
-
-    case stripped do
-      # It is empty
-      [] -> {:expr, 0}
-      # Structs
-      [?%, ?:, ?: | _] -> {{:struct, ''}, 1}
-      [?%, ?: | _] -> {{:unquoted_atom, '%'}, 2}
-      [?% | _] -> {{:struct, ''}, 1}
-      # Token/AST only operators
-      [?>, ?= | rest] when rest == [] or hd(rest) != ?: -> {:expr, 0}
-      [?>, ?- | rest] when rest == [] or hd(rest) != ?: -> {:expr, 0}
-      # Two-digit containers
-      [?<, ?< | rest] when rest == [] or hd(rest) != ?< -> {:expr, 0}
-      # Ambiguity around :
-      [?: | rest] when rest == [] or hd(rest) != ?: -> unquoted_atom_or_expr(spaces)
-      # Dots
-      [?.] -> {:none, 0}
-      [?. | rest] when hd(rest) not in '.:' -> dot(rest, spaces + 1, '')
-      # It is a local or remote call with parens
-      [?( | rest] -> call_to_cursor_context(strip_spaces(rest, spaces + 1))
-      # A local arity definition
-      [?/ | rest] -> arity_to_cursor_context(strip_spaces(rest, spaces + 1))
-      # Starting a new expression
-      [h | _] when h in @starter_punctuation -> {:expr, 0}
-      # It is a local or remote call without parens
-      rest when spaces > 0 -> call_to_cursor_context({rest, spaces})
-      # It is an identifier
-      _ -> identifier_to_cursor_context(reverse, 0, false)
-    end
-  end
-
-  defp strip_spaces([h | rest], count) when h in @space, do: strip_spaces(rest, count + 1)
-  defp strip_spaces(rest, count), do: {rest, count}
-
-  defp unquoted_atom_or_expr(0), do: {{:unquoted_atom, ''}, 1}
-  defp unquoted_atom_or_expr(_), do: {:expr, 0}
-
-  defp arity_to_cursor_context({reverse, spaces}) do
-    case identifier_to_cursor_context(reverse, spaces, true) do
-      {{:local_or_var, acc}, count} -> {{:local_arity, acc}, count}
-      {{:dot, base, acc}, count} -> {{:dot_arity, base, acc}, count}
-      {{:operator, acc}, count} -> {{:operator_arity, acc}, count}
-      {_, _} -> {:none, 0}
-    end
-  end
-
-  defp call_to_cursor_context({reverse, spaces}) do
-    case identifier_to_cursor_context(reverse, spaces, true) do
-      {{:local_or_var, acc}, count} -> {{:local_call, acc}, count}
-      {{:dot, base, acc}, count} -> {{:dot_call, base, acc}, count}
-      {{:operator, acc}, count} -> {{:operator_call, acc}, count}
-      {_, _} -> {:none, 0}
-    end
-  end
-
-  defp identifier_to_cursor_context([?., ?., ?: | _], n, _), do: {{:unquoted_atom, '..'}, n + 3}
-  defp identifier_to_cursor_context([?., ?., ?. | _], n, _), do: {{:local_or_var, '...'}, n + 3}
-  defp identifier_to_cursor_context([?., ?: | _], n, _), do: {{:unquoted_atom, '.'}, n + 2}
-  defp identifier_to_cursor_context([?., ?. | _], n, _), do: {{:operator, '..'}, n + 2}
-
-  defp identifier_to_cursor_context(reverse, count, call_op?) do
-    case identifier(reverse, count) do
-      :none ->
-        {:none, 0}
-
-      :operator ->
-        operator(reverse, count, [], call_op?)
-
-      {:module_attribute, acc, count} ->
-        {{:module_attribute, acc}, count}
-
-      {:sigil, acc, count} ->
-        {{:sigil, acc}, count}
-
-      {:unquoted_atom, acc, count} ->
-        {{:unquoted_atom, acc}, count}
-
-      {:alias, rest, acc, count} ->
-        case strip_spaces(rest, count) do
-          {'.' ++ rest, count} when rest == [] or hd(rest) != ?. ->
-            nested_alias(rest, count + 1, acc)
-
-          {'%' ++ _, count} ->
-            {{:struct, acc}, count + 1}
-
-          _ ->
-            {{:alias, acc}, count}
-        end
-
-      {:identifier, _, acc, count} when call_op? and acc in @textual_operators ->
-        {{:operator, acc}, count}
-
-      {:identifier, rest, acc, count} ->
-        case strip_spaces(rest, count) do
-          {'.' ++ rest, count} when rest == [] or hd(rest) != ?. ->
-            dot(rest, count + 1, acc)
-
-          _ ->
-            {{:local_or_var, acc}, count}
-        end
-    end
-  end
-
-  defp identifier([?? | rest], count), do: check_identifier(rest, count + 1, [??])
-  defp identifier([?! | rest], count), do: check_identifier(rest, count + 1, [?!])
-  defp identifier(rest, count), do: check_identifier(rest, count, [])
-
-  defp check_identifier([h | t], count, acc) when h not in @non_identifier,
-    do: rest_identifier(t, count + 1, [h | acc])
-
-  defp check_identifier(_, _, _), do: :operator
-
-  defp rest_identifier([h | rest], count, acc) when h not in @non_identifier do
-    rest_identifier(rest, count + 1, [h | acc])
-  end
-
-  defp rest_identifier(rest, count, [?@ | acc]) do
-    case tokenize_identifier(rest, count, acc) do
-      {:identifier, _rest, acc, count} -> {:module_attribute, acc, count}
-      :none when acc == [] -> {:module_attribute, '', count}
-      _ -> :none
-    end
-  end
-
-  defp rest_identifier([?~ | rest], count, [letter])
-       when (letter in ?A..?Z or letter in ?a..?z) and
-              (rest == [] or hd(rest) not in @tilde_op_prefix) do
-    {:sigil, [letter], count + 1}
-  end
-
-  defp rest_identifier([?: | rest], count, acc) when rest == [] or hd(rest) != ?: do
-    case String.Tokenizer.tokenize(acc) do
-      {_, _, [], _, _, _} -> {:unquoted_atom, acc, count + 1}
-      _ -> :none
-    end
-  end
-
-  defp rest_identifier([?? | _], _count, _acc) do
-    :none
-  end
-
-  defp rest_identifier(rest, count, acc) do
-    tokenize_identifier(rest, count, acc)
-  end
-
-  defp tokenize_identifier(rest, count, acc) do
-    case String.Tokenizer.tokenize(acc) do
-      # Not actually an atom cause rest is not a :
-      {:atom, _, _, _, _, _} ->
-        :none
-
-      # Aliases must be ascii only
-      {:alias, _, _, _, false, _} ->
-        :none
-
-      {kind, _, [], _, _, extra} ->
-        if ?@ in extra do
-          :none
-        else
-          {kind, rest, acc, count}
-        end
-
-      _ ->
-        :none
-    end
-  end
-
-  defp nested_alias(rest, count, acc) do
-    {rest, count} = strip_spaces(rest, count)
-
-    case identifier_to_cursor_context(rest, count, true) do
-      {{:struct, prev}, count} -> {{:struct, prev ++ '.' ++ acc}, count}
-      {{:alias, prev}, count} -> {{:alias, prev ++ '.' ++ acc}, count}
-      _ -> {:none, 0}
-    end
-  end
-
-  defp dot(rest, count, acc) do
-    {rest, count} = strip_spaces(rest, count)
-
-    case identifier_to_cursor_context(rest, count, true) do
-      {{:local_or_var, var}, count} -> {{:dot, {:var, var}, acc}, count}
-      {{:unquoted_atom, _} = prev, count} -> {{:dot, prev, acc}, count}
-      {{:alias, _} = prev, count} -> {{:dot, prev, acc}, count}
-      {{:dot, _, _} = prev, count} -> {{:dot, prev, acc}, count}
-      {{:module_attribute, _} = prev, count} -> {{:dot, prev, acc}, count}
-      {{:struct, acc}, count} -> {{:struct, acc ++ '.'}, count}
-      {_, _} -> {:none, 0}
-    end
-  end
-
-  defp operator([h | rest], count, acc, call_op?) when h in @operators do
-    operator(rest, count + 1, [h | acc], call_op?)
-  end
-
-  defp operator(rest, count, acc, call_op?) when acc in @incomplete_operators do
-    {rest, dot_count} = strip_spaces(rest, count)
-
-    cond do
-      call_op? ->
-        {:none, 0}
-
-      match?([?. | rest] when rest == [] or hd(rest) != ?., rest) ->
-        dot(tl(rest), dot_count + 1, acc)
-
-      acc == '~' ->
-        {{:sigil, ''}, count}
-
-      true ->
-        {{:operator, acc}, count}
-    end
-  end
-
-  # If we are opening a sigil, ignore the operator.
-  defp operator([letter, ?~ | rest], _count, [op], _call_op?)
-       when op in '<|/' and (letter in ?A..?Z or letter in ?a..?z) and
-              (rest == [] or hd(rest) not in @tilde_op_prefix) do
-    {:none, 0}
-  end
-
-  defp operator(rest, count, acc, _call_op?) do
-    case elixir_tokenizer_tokenize(acc, 1, 1, []) do
-      {:ok, _, [{:atom, _, _}]} ->
-        {{:unquoted_atom, tl(acc)}, count}
-
-      {:ok, _, [{_, _, op}]} ->
-        {rest, dot_count} = strip_spaces(rest, count)
-
-        cond do
-          Code.Identifier.unary_op(op) == :error and Code.Identifier.binary_op(op) == :error ->
-            :none
-
-          match?([?. | rest] when rest == [] or hd(rest) != ?., rest) ->
-            dot(tl(rest), dot_count + 1, acc)
-
-          true ->
-            {{:operator, acc}, count}
-        end
-
-      _ ->
-        {:none, 0}
-    end
-  end
-
-  @doc """
-  Receives a string and returns the surround context.
-
-  This function receives a string with an Elixir code fragment
-  and a `position`. It returns a map containing the beginning
-  and ending of the expression alongside its context, or `:none`
-  if there is nothing with a known context.
-
-  The difference between `cursor_context/2` and `surround_context/3`
-  is that the former assumes the expression in the code fragment
-  is incomplete. For example, `do` in `cursor_context/2` may be
-  a keyword or a variable or a local call, while `surround_context/3`
-  assumes the expression in the code fragment is complete, therefore
-  `do` would always be a keyword.
-
-  The `position` contains both the `line` and `column`, both starting
-  with the index of 1. The column must precede the surrounding expression.
-  For example, the expression `foo`, will return something for the columns
-  1, 2, and 3, but not 4:
-
-      foo
-      ^ column 1
-
-      foo
-       ^ column 2
-
-      foo
-        ^ column 3
-
-      foo
-         ^ column 4
-
-  The returned map contains the column the expression starts and the
-  first column after the expression ends.
-
-  Similar to `cursor_context/2`, this function also provides a best-effort
-  detection and may not be accurate under all circumstances. See the
-  "Return values" and "Limitations" section under `cursor_context/2` for
-  more information.
-
-  ## Examples
-
-      iex> Code.Fragment.surround_context("foo", {1, 1})
-      %{begin: {1, 1}, context: {:local_or_var, 'foo'}, end: {1, 4}}
-
-  ## Differences to `cursor_context/2`
-
-  Because `surround_context/3` deals with complete code, it has some
-  difference to `cursor_context/2`:
-
-    * `dot_call`/`dot_arity` and `operator_call`/`operator_arity`
-      are collapsed into `dot` and `operator` contexts respectively
-      as they are not meaningful distinction between them
-
-    * On the other hand, this function still makes a distinction between
-      `local_call`/`local_arity` and `local_or_var`, since the latter can
-      be a local or variable
-
-    * `@` when not followed by any identifier is returned as `{:operator, '@'}`
-      (in contrast to `{:module_attribute, ''}` in `cursor_context/2`
-
-    * This function never returns empty sigils `{:sigil, ''}` or empty structs
-      `{:struct, ''}` as context
-  """
-  @doc since: "1.13.0"
-  @spec surround_context(List.Chars.t(), position(), keyword()) ::
-          %{begin: position, end: position, context: context} | :none
-        when context:
-               {:alias, charlist}
-               | {:dot, inside_dot, charlist}
-               | {:local_or_var, charlist}
-               | {:local_arity, charlist}
-               | {:local_call, charlist}
-               | {:module_attribute, charlist}
-               | {:operator, charlist}
-               | {:unquoted_atom, charlist},
-             inside_dot:
-               {:alias, charlist}
-               | {:dot, inside_dot, charlist}
-               | {:module_attribute, charlist}
-               | {:unquoted_atom, charlist}
-               | {:var, charlist}
-  def surround_context(fragment, position, options \\ [])
-
-  def surround_context(binary, {line, column}, opts) when is_binary(binary) do
-    binary
-    |> String.split("\n")
-    |> Enum.at(line - 1, '')
-    |> String.to_charlist()
-    |> position_surround_context(line, column, opts)
-  end
-
-  def surround_context(charlist, {line, column}, opts) when is_list(charlist) do
-    charlist
-    |> :string.split('\n', :all)
-    |> Enum.at(line - 1, '')
-    |> position_surround_context(line, column, opts)
-  end
-
-  def surround_context(other, position, opts) do
-    surround_context(to_charlist(other), position, opts)
-  end
-
-  defp position_surround_context(charlist, line, column, opts)
-       when is_integer(line) and line >= 1 and is_integer(column) and column >= 1 do
-    {reversed_pre, post} = string_reverse_at(charlist, column - 1, [])
-    {reversed_pre, post} = adjust_position(reversed_pre, post)
-
-    case take_identifier(post, []) do
-      {_, [], _} ->
-        maybe_operator(reversed_pre, post, line, opts)
-
-      {:identifier, reversed_post, rest} ->
-        {rest, _} = strip_spaces(rest, 0)
-        reversed = reversed_post ++ reversed_pre
-
-        case codepoint_cursor_context(reversed, opts) do
-          {{:struct, acc}, offset} ->
-            build_surround({:struct, acc}, reversed, line, offset)
-
-          {{:alias, acc}, offset} ->
-            build_surround({:alias, acc}, reversed, line, offset)
-
-          {{:dot, _, [_ | _]} = dot, offset} ->
-            build_surround(dot, reversed, line, offset)
-
-          {{:local_or_var, acc}, offset} when hd(rest) == ?( ->
-            build_surround({:local_call, acc}, reversed, line, offset)
-
-          {{:local_or_var, acc}, offset} when hd(rest) == ?/ ->
-            build_surround({:local_arity, acc}, reversed, line, offset)
-
-          {{:local_or_var, acc}, offset} when acc in @textual_operators ->
-            build_surround({:operator, acc}, reversed, line, offset)
-
-          {{:local_or_var, acc}, offset} when acc not in ~w(do end after else catch rescue)c ->
-            build_surround({:local_or_var, acc}, reversed, line, offset)
-
-          {{:module_attribute, ''}, offset} ->
-            build_surround({:operator, '@'}, reversed, line, offset)
-
-          {{:module_attribute, acc}, offset} ->
-            build_surround({:module_attribute, acc}, reversed, line, offset)
-
-          {{:sigil, acc}, offset} ->
-            build_surround({:sigil, acc}, reversed, line, offset)
-
-          {{:unquoted_atom, acc}, offset} ->
-            build_surround({:unquoted_atom, acc}, reversed, line, offset)
-
-          _ ->
-            maybe_operator(reversed_pre, post, line, opts)
-        end
-
-      {:alias, reversed_post, _rest} ->
-        reversed = reversed_post ++ reversed_pre
-
-        case codepoint_cursor_context(reversed, opts) do
-          {{:alias, acc}, offset} ->
-            build_surround({:alias, acc}, reversed, line, offset)
-
-          {{:struct, acc}, offset} ->
-            build_surround({:struct, acc}, reversed, line, offset)
-
-          _ ->
-            :none
-        end
-    end
-  end
-
-  defp maybe_operator(reversed_pre, post, line, opts) do
-    case take_operator(post, []) do
-      {[], _rest} ->
-        :none
-
-      {reversed_post, rest} ->
-        reversed = reversed_post ++ reversed_pre
-
-        case codepoint_cursor_context(reversed, opts) do
-          {{:operator, acc}, offset} when acc not in @incomplete_operators ->
-            build_surround({:operator, acc}, reversed, line, offset)
-
-          {{:sigil, ''}, offset} when hd(rest) in ?A..?Z or hd(rest) in ?a..?z ->
-            build_surround({:sigil, [hd(rest)]}, [hd(rest) | reversed], line, offset + 1)
-
-          {{:dot, _, [_ | _]} = dot, offset} ->
-            build_surround(dot, reversed, line, offset)
-
-          _ ->
-            :none
-        end
-    end
-  end
-
-  defp build_surround(context, reversed, line, offset) do
-    {post, reversed_pre} = enum_reverse_at(reversed, offset, [])
-    pre = :lists.reverse(reversed_pre)
-    pre_length = :string.length(pre) + 1
-
-    %{
-      context: context,
-      begin: {line, pre_length},
-      end: {line, pre_length + :string.length(post)}
-    }
-  end
-
-  defp take_identifier([h | t], acc) when h in @trailing_identifier,
-    do: {:identifier, [h | acc], t}
-
-  defp take_identifier([h | t], acc) when h not in @non_identifier,
-    do: take_identifier(t, [h | acc])
-
-  defp take_identifier(rest, acc) do
-    with {[?. | t], _} <- strip_spaces(rest, 0),
-         {[h | _], _} when h in ?A..?Z <- strip_spaces(t, 0) do
-      take_alias(rest, acc)
-    else
-      _ -> {:identifier, acc, rest}
-    end
-  end
-
-  defp take_alias([h | t], acc) when h not in @non_identifier,
-    do: take_alias(t, [h | acc])
-
-  defp take_alias(rest, acc) do
-    with {[?. | t], acc} <- move_spaces(rest, acc),
-         {[h | t], acc} when h in ?A..?Z <- move_spaces(t, [?. | acc]) do
-      take_alias(t, [h | acc])
-    else
-      _ -> {:alias, acc, rest}
-    end
-  end
-
-  defp take_operator([h | t], acc) when h in @operators, do: take_operator(t, [h | acc])
-  defp take_operator([h | t], acc) when h == ?., do: take_operator(t, [h | acc])
-  defp take_operator(rest, acc), do: {acc, rest}
-
-  # Unquoted atom handling
-  defp adjust_position(reversed_pre, [?: | post])
-       when hd(post) != ?: and (reversed_pre == [] or hd(reversed_pre) != ?:) do
-    {[?: | reversed_pre], post}
-  end
-
-  defp adjust_position(reversed_pre, [?% | post]) do
-    adjust_position([?% | reversed_pre], post)
-  end
-
-  # Dot/struct handling
-  defp adjust_position(reversed_pre, post) do
-    case move_spaces(post, reversed_pre) do
-      # If we are between spaces and a dot, move past the dot
-      {[?. | post], reversed_pre} when hd(post) != ?. and hd(reversed_pre) != ?. ->
-        {post, reversed_pre} = move_spaces(post, [?. | reversed_pre])
-        {reversed_pre, post}
-
-      _ ->
-        case strip_spaces(reversed_pre, 0) do
-          # If there is a dot to our left, make sure to move to the first character
-          {[?. | rest], _} when rest == [] or hd(rest) not in '.:' ->
-            {post, reversed_pre} = move_spaces(post, reversed_pre)
-            {reversed_pre, post}
-
-          # If there is a % to our left, make sure to move to the first character
-          {[?% | _], _} ->
-            case move_spaces(post, reversed_pre) do
-              {[h | _] = post, reversed_pre} when h in ?A..?Z ->
-                {reversed_pre, post}
-
-              _ ->
-                {reversed_pre, post}
-            end
-
-          _ ->
-            {reversed_pre, post}
-        end
-    end
-  end
-
-  defp move_spaces([h | t], acc) when h in @space, do: move_spaces(t, [h | acc])
-  defp move_spaces(t, acc), do: {t, acc}
-
-  defp string_reverse_at(charlist, 0, acc), do: {acc, charlist}
-
-  defp string_reverse_at(charlist, n, acc) do
-    case :unicode_util.gc(charlist) do
-      [gc | cont] when is_integer(gc) -> string_reverse_at(cont, n - 1, [gc | acc])
-      [gc | cont] when is_list(gc) -> string_reverse_at(cont, n - 1, :lists.reverse(gc, acc))
-      [] -> {acc, []}
-    end
-  end
-
-  defp enum_reverse_at([h | t], n, acc) when n > 0, do: enum_reverse_at(t, n - 1, [h | acc])
-  defp enum_reverse_at(rest, _, acc), do: {acc, rest}
-
-  # ---
-
-  # See: https://github.com/elixir-lang/elixir/pull/11143/files#r676519050
-  def elixir_tokenizer_tokenize(string, line, columns, opts) do
-    with {:ok, tokens} <- :elixir_tokenizer.tokenize(string, line, columns, opts) do
-      {:ok, [], tokens}
-    end
+        do: %{
+          kind: :module_attribute,
+          name: attribute,
+          documentation: {"text/markdown", info.doc}
+        }
   end
 end
